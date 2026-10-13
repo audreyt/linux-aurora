@@ -900,8 +900,10 @@ class M3FlowTest(M3FlowBase):
             "omarchy hyprland-guiutils 0.2.2-3 [installed]")
         self.extra_env["FAKE_UPGRADES"] = (
             "hyprland-guiutils 0.2.2-3 -> 0.2.2-4\nhyprtoolkit 0.5.4-5.1 -> 0.6.0-1")
-        self.install()
+        proc = self.install()
         self.assertIn("pacman -U", self.log())
+        # The skip is said, naming exactly the packages Omarchy keeps at its own builds.
+        self.assertIn("Not counting hyprland-guiutils hyprtoolkit as pending", proc.stdout + proc.stderr)
 
     def test_omarchy_arm_repository_pins_do_not_hide_other_upgrades(self):
         self.mac("j313")
@@ -925,8 +927,10 @@ class M3FlowTest(M3FlowBase):
         self.extra_env["FAKE_REPO_LIST"] = "omarchy hyprtoolkit 0.5.4-5.1 [installed]"
         self.extra_env["FAKE_UPGRADES"] = "hyprtoolkit 0.5.4-5.1 -> 0.6.0-1"
         helper = self.tmp / "omarchy/arm-package-sources.sh"
-        # No helper, then one that fails: nothing is pinned and the usual refusal follows.
-        for body in (None, "exit 3\n"):
+        # No helper, then one that fails (before or after naming a target): nothing is pinned and
+        # the usual refusal follows.
+        for body in (None, "exit 3\n",
+                     "omarchy_arm_package_targets() {\n  printf '%s\\n' omarchy/hyprtoolkit\n  return 1\n}\n"):
             with self.subTest(helper=body):
                 if body is not None:
                     helper.parent.mkdir(exist_ok=True)
