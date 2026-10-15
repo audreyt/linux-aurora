@@ -106,12 +106,18 @@ bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp)
 				     dcp->hw.t6020_tunnel_flow, connector_wired);
 }
 
+/* The HDMI port's HPD line reads high. */
+bool dcp_hdmi_hpd_high(struct apple_dcp *dcp)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_hdmi_hpd_high, dcp);
+
+	return gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
+}
+
 bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 {
-	KUNIT_STATIC_STUB_REDIRECT(dcp_hdmi_port_attached, dcp);
-
 	return dcp->hdmi_hpd && !READ_ONCE(dcp->active_typec_route) &&
-	       gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
+	       dcp_hdmi_hpd_high(dcp);
 }
 
 static bool dcp_typec_route_is_dp(const struct typec_mux_state *state)
@@ -3780,6 +3786,8 @@ static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp)
 void dcp_fabric_hdmi_retry(struct apple_dcp *dcp)
 {
 	int ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_fabric_hdmi_retry, dcp);
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (dcp->active_typec_route || gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0) {

@@ -43,6 +43,9 @@ struct hold_fixture {
 	atomic_t relinks;
 	/* The HDMI HPD level, for the fixed HDMI output. */
 	bool hdmi_hpd;
+	/* HDMI relinks asked for, and the HPD level each one found. */
+	unsigned int hdmi_relinks;
+	bool hdmi_relink_hpd;
 };
 
 static const struct drm_display_mode hold_1080p = {
@@ -196,18 +199,33 @@ static void hold_attach(struct kunit *test, struct hold_fixture *f)
 }
 
 /* Stands in for the HDMI HPD GPIO, which the test machine does not have. */
-static bool hold_hdmi_port_attached(struct apple_dcp *dcp)
+static bool hold_hdmi_hpd_high(struct apple_dcp *dcp)
 {
 	return READ_ONCE(container_of(dcp, struct hold_fixture, dcp)->hdmi_hpd);
 }
 
-/* The pipe drives its fixed HDMI output, with HPD at @hpd. */
+/* Stands in for the HDMI relink through the fabric: counts it. */
+static void hold_hdmi_relink(struct apple_dcp *dcp)
+{
+	struct hold_fixture *f = container_of(dcp, struct hold_fixture, dcp);
+
+	f->hdmi_relinks++;
+	f->hdmi_relink_hpd = READ_ONCE(f->hdmi_hpd);
+}
+
+/*
+ * The pipe drives its fixed HDMI output, with HPD at @hpd. The HPD GPIO is
+ * a value no GPIO call accepts: only the stubs above read it.
+ */
 static void hold_use_hdmi(struct kunit *test, struct hold_fixture *f, bool hpd)
 {
 	f->dcp.fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
+	f->dcp.fixed_connector = &f->connector;
+	f->dcp.hdmi_hpd = ERR_PTR(-ENODEV);
 	f->dcp.typec_cable_connected = false;
 	f->hdmi_hpd = hpd;
-	kunit_activate_static_stub(test, dcp_hdmi_port_attached, hold_hdmi_port_attached);
+	kunit_activate_static_stub(test, dcp_hdmi_hpd_high, hold_hdmi_hpd_high);
+	kunit_activate_static_stub(test, dcp_fabric_hdmi_retry, hold_hdmi_relink);
 }
 
 /* The desktop set the mode, which also resets the retry count. */
@@ -452,7 +470,7 @@ static void hold_hdmi_every_withdrawal(struct kunit *test)
 
 /*
  * Not described again, and the display unplugged meanwhile: the retry
- * reports one disconnect.
+ * reports one disconnect, then goes to the HDMI relink, which finds no HPD.
  */
 static void hold_hdmi_not_back_releases(struct kunit *test)
 {
@@ -474,6 +492,47 @@ static void hold_hdmi_not_back_releases(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_disconnected);
 	KUNIT_EXPECT_EQ(test, hold_probe(f, &status, NULL), 0);
 	KUNIT_EXPECT_EQ(test, status, connector_status_disconnected);
+	KUNIT_EXPECT_EQ(test, f->hdmi_relinks, 1U);
+	KUNIT_EXPECT_FALSE(test, f->hdmi_relink_hpd);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->relinks), 0);
+}
+
+/*
+ * Not described again with the display still plugged in: one disconnect,
+ * then the HDMI relink with HPD high, not the Type-C one.
+ */
+static void hold_hdmi_not_back_relinks(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+
+	hold_fire_retry(test, f);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(f->connector.connected));
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+	KUNIT_EXPECT_EQ(test, f->hdmi_relinks, 1U);
+	KUNIT_EXPECT_TRUE(test, f->hdmi_relink_hpd);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->relinks), 0);
+}
+
+/* The HDMI port counts as attached only with its own HPD, not lent out. */
+static void hold_hdmi_port_attached_requires(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+
+	KUNIT_EXPECT_FALSE(test, dcp_hdmi_port_attached(&f->dcp));
+	hold_use_hdmi(test, f, false);
+	KUNIT_EXPECT_FALSE(test, dcp_hdmi_port_attached(&f->dcp));
+	f->hdmi_hpd = true;
+	KUNIT_EXPECT_TRUE(test, dcp_hdmi_port_attached(&f->dcp));
+	f->route.dcp = &f->dcp;
+	f->dcp.active_typec_route = &f->route;
+	KUNIT_EXPECT_FALSE(test, dcp_hdmi_port_attached(&f->dcp));
+	f->dcp.active_typec_route = NULL;
 }
 
 /* HDMI HPD low at the withdrawal: a disconnect at once, no retry. */
@@ -550,6 +609,8 @@ static struct kunit_case hold_test_cases[] = {
 	KUNIT_CASE(hold_hdmi_keeps_modes),
 	KUNIT_CASE(hold_hdmi_every_withdrawal),
 	KUNIT_CASE(hold_hdmi_not_back_releases),
+	KUNIT_CASE(hold_hdmi_not_back_relinks),
+	KUNIT_CASE(hold_hdmi_port_attached_requires),
 	KUNIT_CASE(hold_hdmi_hpd_low_disconnects),
 	KUNIT_CASE(hold_hdmi_needs_queued_retry),
 	KUNIT_CASE(hold_not_for_tunnel),
