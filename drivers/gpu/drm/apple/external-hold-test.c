@@ -574,6 +574,38 @@ static void hold_hdmi_earlier_retry_deferred(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, READ_ONCE(f->dcp.external_retry_wq.timer.expires), expires);
 }
 
+/*
+ * A withdrawal while the pipe's connector is not its fixed HDMI one (a
+ * Type-C display being handed back), or before the HDMI display was
+ * reported connected: no HDMI retry and no hold, as before HDMI holds.
+ */
+static void hold_hdmi_only_reported_display(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+	struct apple_connector *other;
+
+	other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	hold_use_hdmi(test, f, true);
+
+	/* Not reported connected yet: the withdrawal changes nothing. */
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_retries), 0);
+
+	/* Connected, but the fixed connector is another one. */
+	hold_attach(test, f);
+	f->dcp.fixed_connector = other;
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(f->connector.connected));
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+	KUNIT_EXPECT_EQ(test, f->observed_status, connector_status_disconnected);
+}
+
 /* The HDMI port counts as attached only with its own HPD, not lent out. */
 static void hold_hdmi_port_attached_requires(struct kunit *test)
 {
@@ -666,6 +698,7 @@ static struct kunit_case hold_test_cases[] = {
 	KUNIT_CASE(hold_hdmi_not_back_releases),
 	KUNIT_CASE(hold_hdmi_not_back_relinks),
 	KUNIT_CASE(hold_hdmi_earlier_retry_deferred),
+	KUNIT_CASE(hold_hdmi_only_reported_display),
 	KUNIT_CASE(hold_hdmi_port_attached_requires),
 	KUNIT_CASE(hold_hdmi_hpd_low_disconnects),
 	KUNIT_CASE(hold_hdmi_needs_queued_retry),
