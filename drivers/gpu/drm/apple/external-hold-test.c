@@ -622,6 +622,57 @@ static void hold_hdmi_port_attached_requires(struct kunit *test)
 	f->dcp.active_typec_route = NULL;
 }
 
+/*
+ * An HDMI attach while a display is held keeps the retry that bounds the
+ * hold, and its count. Once the held connector was reported disconnected,
+ * by any path, the attach clears the hold and starts its retries afresh.
+ */
+static void hold_hdmi_attach_keeps_bounding_retry(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_ASSERT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+	KUNIT_ASSERT_EQ(test, atomic_read(&f->dcp.external_retries), 1);
+
+	dcp_hdmi_attach_retries(&f->dcp);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_retries), 1);
+	KUNIT_EXPECT_TRUE(test, iomfb_v14_7_external_holding(&f->dcp));
+
+	WRITE_ONCE(f->connector.connected, false);
+	KUNIT_EXPECT_FALSE(test, iomfb_v14_7_external_holding(&f->dcp));
+	dcp_hdmi_attach_retries(&f->dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_retries), 0);
+}
+
+/*
+ * The retry bounding a hold is dropped because a display was attached or
+ * detached since: that change owns the connector, and nothing stays held.
+ */
+static void hold_dropped_retry_ends_hold(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_ASSERT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+
+	f->dcp.typec_generation++;
+	hold_fire_retry(test, f);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 0);
+	KUNIT_EXPECT_EQ(test, f->hdmi_relinks, 0U);
+	KUNIT_EXPECT_EQ(test, f->notifications, 1U);
+}
+
 /* HDMI HPD low at the withdrawal: a disconnect at once, no retry. */
 static void hold_hdmi_hpd_low_disconnects(struct kunit *test)
 {
@@ -700,6 +751,8 @@ static struct kunit_case hold_test_cases[] = {
 	KUNIT_CASE(hold_hdmi_earlier_retry_deferred),
 	KUNIT_CASE(hold_hdmi_only_reported_display),
 	KUNIT_CASE(hold_hdmi_port_attached_requires),
+	KUNIT_CASE(hold_hdmi_attach_keeps_bounding_retry),
+	KUNIT_CASE(hold_dropped_retry_ends_hold),
 	KUNIT_CASE(hold_hdmi_hpd_low_disconnects),
 	KUNIT_CASE(hold_hdmi_needs_queued_retry),
 	KUNIT_CASE(hold_not_for_tunnel),

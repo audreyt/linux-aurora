@@ -796,6 +796,16 @@ void dcp_external_retry_defer(struct apple_dcp *dcp, unsigned int min_ms)
 	mod_delayed_work(system_freezable_wq, retry, msecs_to_jiffies(min_ms));
 }
 
+/*
+ * Drop the queued retry. A display kept connected through a withdrawal is
+ * no longer bounded by it: whatever dropped it now owns the connector.
+ */
+static void dcp_external_retry_cancel(struct apple_dcp *dcp)
+{
+	cancel_delayed_work(&dcp->external_retry_wq);
+	atomic_set(&dcp->external_held, 0);
+}
+
 /* The active CRTC's mode is the one the firmware runs and shows swaps in. */
 static bool dcp_external_crtc_showing(struct apple_dcp *dcp)
 {
@@ -821,6 +831,8 @@ void dcp_external_retry_work(struct work_struct *work)
 
 	if (READ_ONCE(dcp->typec_generation) != generation) {
 		dev_info(dcp->dev, "display retry: the display was attached or detached since; dropped\n");
+		/* That attach or detach owns the connector, held or not. */
+		atomic_set(&dcp->external_held, 0);
 		return;
 	}
 	/* Kept connected through a withdrawal, and not described again. */
@@ -1135,7 +1147,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		/* A newly attached display gets its own retries. */
 		if (dcp->external_native) {
 			atomic_set(&dcp->external_retries, 0);
-			cancel_delayed_work(&dcp->external_retry_wq);
+			dcp_external_retry_cancel(dcp);
 		}
 	}
 
@@ -1156,7 +1168,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 			dcp->typec_generation++;
 			/* Nothing left to retry for the display that went. */
 			if (dcp->external_native)
-				cancel_delayed_work(&dcp->external_retry_wq);
+				dcp_external_retry_cancel(dcp);
 		}
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);

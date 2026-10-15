@@ -647,6 +647,19 @@ void iomfb_v14_7_external_withdrawn(struct apple_dcp *dcp)
 }
 
 /*
+ * Whether a display is kept connected through a withdrawal now: held, and
+ * its connector still connected. A connector reported disconnected since,
+ * by any path, has nothing held.
+ */
+bool iomfb_v14_7_external_holding(struct apple_dcp *dcp)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	return atomic_read(&dcp->external_held) && connector &&
+	       READ_ONCE(connector->connected);
+}
+
+/*
  * The retry found the display of a connector kept connected by
  * dcp_v14_external_hold() not described again: report it disconnected.
  * Returns whether it did.
