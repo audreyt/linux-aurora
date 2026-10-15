@@ -778,6 +778,24 @@ void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
 	mod_delayed_work(system_freezable_wq, &dcp->external_retry_wq, msecs_to_jiffies(delay));
 }
 
+/*
+ * A hold that starts now is bounded by the queued retry: make that retry
+ * fire no sooner than @min_ms from now, without charging another attempt.
+ * One queued for an earlier withdrawal can be due a moment later, and would
+ * end the new hold before the display had time to be described again. A
+ * retry due later is left as it is.
+ */
+void dcp_external_retry_defer(struct apple_dcp *dcp, unsigned int min_ms)
+{
+	struct delayed_work *retry = &dcp->external_retry_wq;
+	unsigned long due = jiffies + msecs_to_jiffies(min_ms);
+
+	if (!delayed_work_pending(retry) || !time_before(READ_ONCE(retry->timer.expires), due))
+		return;
+	dev_info(dcp->dev, "display retry deferred: due again in %u ms\n", min_ms);
+	mod_delayed_work(system_freezable_wq, retry, msecs_to_jiffies(min_ms));
+}
+
 /* The active CRTC's mode is the one the firmware runs and shows swaps in. */
 static bool dcp_external_crtc_showing(struct apple_dcp *dcp)
 {

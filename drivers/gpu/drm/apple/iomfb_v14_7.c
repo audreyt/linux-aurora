@@ -631,6 +631,9 @@ void iomfb_v14_7_external_withdrawn(struct apple_dcp *dcp)
 	    hdmi_hpd)
 		dcp_external_retry(dcp, "display withdrawn while its port has HPD",
 				   0, DCP_V14_DESC_RELINK_MS);
+	/* A retry queued for an earlier withdrawal bounds this hold too. */
+	if (hdmi_hpd)
+		dcp_external_retry_defer(dcp, DCP_V14_DESC_RELINK_MS);
 	if (!dcp_v14_external_hold(dcp, hdmi_hpd))
 		dcp_v14_external_hotplug(dcp, false);
 }

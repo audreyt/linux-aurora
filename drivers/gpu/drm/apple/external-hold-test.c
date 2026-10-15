@@ -29,6 +29,7 @@
 #include "parser.h"
 
 #define HOLD_MAX_RETRIES 3	/* DCP_EXTERNAL_RETRIES */
+#define HOLD_RELINK_MS 2000	/* DCP_V14_DESC_RELINK_MS */
 
 struct hold_fixture {
 	struct drm_device *drm;
@@ -226,6 +227,19 @@ static void hold_use_hdmi(struct kunit *test, struct hold_fixture *f, bool hpd)
 	f->hdmi_hpd = hpd;
 	kunit_activate_static_stub(test, dcp_hdmi_hpd_high, hold_hdmi_hpd_high);
 	kunit_activate_static_stub(test, dcp_fabric_hdmi_retry, hold_hdmi_relink);
+}
+
+/* The queued retry is due in @ms, as one queued earlier would be. */
+static void hold_retry_due_in(struct kunit *test, struct hold_fixture *f, unsigned int ms)
+{
+	KUNIT_ASSERT_TRUE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	mod_delayed_work(system_freezable_wq, &f->dcp.external_retry_wq, msecs_to_jiffies(ms));
+}
+
+/* How long until the queued retry fires, in jiffies. */
+static long hold_retry_due(struct hold_fixture *f)
+{
+	return (long)(READ_ONCE(f->dcp.external_retry_wq.timer.expires) - jiffies);
 }
 
 /* The desktop set the mode, which also resets the retry count. */
@@ -519,6 +533,47 @@ static void hold_hdmi_not_back_relinks(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&f->relinks), 0);
 }
 
+/*
+ * A mode set's withdrawal while the retry of an earlier one is still
+ * queued, and about to fire: the hold gets the whole relink delay, and no
+ * retry is charged for it. A retry due later is left as it is.
+ */
+static void hold_hdmi_earlier_retry_deferred(struct kunit *test)
+{
+	struct hold_fixture *f = test->priv;
+	unsigned long expires;
+
+	hold_use_hdmi(test, f, true);
+	hold_attach(test, f);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	dcp_v14_external_hotplug(&f->dcp, true);
+	flush_work(&f->connector.hotplug_wq);
+	hold_mode_set(f);
+	KUNIT_ASSERT_EQ(test, f->notifications, 2U);
+
+	/* The first retry is nearly due when the mode set's withdrawal comes. */
+	hold_retry_due_in(test, f, 200);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->dcp.external_retry_wq));
+	KUNIT_EXPECT_GT(test, hold_retry_due(f),
+			(long)msecs_to_jiffies(HOLD_RELINK_MS - 100));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_retries), 0);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(f->connector.connected));
+	KUNIT_EXPECT_EQ(test, f->notifications, 2U);
+
+	/* Back, and withdrawn again with the retry due well after the delay. */
+	dcp_v14_external_hotplug(&f->dcp, true);
+	flush_work(&f->connector.hotplug_wq);
+	hold_retry_due_in(test, f, 4 * HOLD_RELINK_MS);
+	expires = READ_ONCE(f->dcp.external_retry_wq.timer.expires);
+	iomfb_v14_7_external_withdrawn(&f->dcp);
+	flush_work(&f->connector.hotplug_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->dcp.external_held), 1);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->dcp.external_retry_wq.timer.expires), expires);
+}
+
 /* The HDMI port counts as attached only with its own HPD, not lent out. */
 static void hold_hdmi_port_attached_requires(struct kunit *test)
 {
@@ -610,6 +665,7 @@ static struct kunit_case hold_test_cases[] = {
 	KUNIT_CASE(hold_hdmi_every_withdrawal),
 	KUNIT_CASE(hold_hdmi_not_back_releases),
 	KUNIT_CASE(hold_hdmi_not_back_relinks),
+	KUNIT_CASE(hold_hdmi_earlier_retry_deferred),
 	KUNIT_CASE(hold_hdmi_port_attached_requires),
 	KUNIT_CASE(hold_hdmi_hpd_low_disconnects),
 	KUNIT_CASE(hold_hdmi_needs_queued_retry),
