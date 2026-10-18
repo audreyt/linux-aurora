@@ -1877,30 +1877,11 @@
 	};
 };
 
-/* The loader publishes external resources after validating their firmware. */
+/*
+ * External display resources stay disabled. The internal panel keeps its
+ * single disp0_dart mapping, which the loader brings up at boot. Enabling
+ * the external route also requires the loader to bring up dispext0_dart;
+ * until that profile is qualified the controller, its route and its DART
+ * remain dormant. The dtsi defines them in the disabled state.
+ */
 #include "t8140-j700-dcpext.dtsi"
-
-&display {
-	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
-};
-
-&dcpext {
-	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
-	clock-names = "clock-154", "clock-194";
-	phys = <&atcphy0 PHY_TYPE_DP>;
-	phy-names = "typec0";
-	mux-controls = <&dpxbar0 0>;
-	mux-control-names = "typec0";
-	apple,typec-mux-indices = <2>;
-	apple,typec-dptx-phys = <0>;
-	apple,dcp-index = <1>;
-};
-
-&{/soc/dcp@416e00000/typec-routes/route@0} {
-	status = "okay";
-};
-
-/* Allocate scanout buffers in the window used by the inherited firmware. */
-&dcpext0_dart {
-	apple,dma-range = <0x100 0x0 0x10 0x0>;
-};
