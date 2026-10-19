@@ -5,6 +5,7 @@
 use crate::module_parameters;
 use kernel::bindings;
 use kernel::{
+    c_str,
     device::{
         Core,
         DeviceContext, //
@@ -100,6 +101,9 @@ impl drm::driver::Driver for AsahiDrmDriver {
     const FEAT_RENDER: bool = true;
     const FEAT_SYNCOBJ: bool = true;
     const FEAT_SYNCOBJ_TIMELINE: bool = true;
+    const SHOW_FDINFO: Option<
+        unsafe extern "C" fn(*mut bindings::drm_printer, *mut bindings::drm_file),
+    > = Some(bindings::drm_show_memory_stats);
 
     kernel::declare_drm_ioctls! {
         (ASAHI_GET_PARAMS,      drm_asahi_get_params,
