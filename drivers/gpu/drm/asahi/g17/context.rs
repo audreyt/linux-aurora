@@ -142,6 +142,7 @@ impl Context {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        scheduler.classify_memory(crate::agx_memory_stats::KernelCategory::Scheduler);
         scheduler.initialize::<fw::Scheduler>(0, |value| {
             value.init();
             Ok(())

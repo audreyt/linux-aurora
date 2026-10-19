@@ -66,6 +66,9 @@ unsafe impl Send for KernelObject {}
 unsafe impl Sync for KernelObject {}
 
 impl KernelObject {
+    pub(crate) fn classify_memory(&self, category: crate::agx_memory_stats::KernelCategory) {
+        self.obj.gem.classify_memory(category);
+    }
     /// Allocates a zeroed object of `size` bytes and maps it into `vm`.
     pub(crate) fn new(
         dev: &AsahiDrmDevice,
@@ -478,6 +481,13 @@ impl Pool {
             });
         }
         let object = alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, cpu)?;
+        use crate::agx_memory_stats::KernelCategory;
+        object.classify_memory(match family {
+            Family::Descriptor => KernelCategory::Descriptor,
+            Family::WorkState => KernelCategory::WorkState,
+            Family::QueueState => KernelCategory::QueueState,
+            Family::QueueConfig => KernelCategory::QueueConfig,
+        });
         let reserved = {
             let mut inner = self.inner.lock();
             if inner.stopped {

@@ -13,6 +13,7 @@ use crate::g17::{
     },
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
 };
+use crate::agx_memory_stats::KernelCategory;
 use crate::{
     hw::t8140::{dynamic, kernel_window, low, queues, resources as cfg},
     mmu,
@@ -140,6 +141,7 @@ impl Graph {
             prot,
             CpuMap::WriteCombined,
         )?;
+        support.classify_memory(KernelCategory::QueueSupport);
         let address = queues.gpu_va();
         for stage in 0..2 {
             queues.write(
@@ -241,6 +243,7 @@ struct Compact {
 impl Compact {
     fn new(alloc: &Allocator<'_>, vm: &mmu::Vm, size: usize) -> Result<Self> {
         let backing = KernelObject::backing(alloc.dev, size, CpuMap::WriteCombined)?;
+        backing.classify_memory(KernelCategory::Scratch);
         let mapping = buffer::compact_alias(
             &backing,
             vm,
@@ -266,14 +269,16 @@ pub(super) struct Generation {
 }
 impl Generation {
     fn allocate_state(alloc: &Allocator<'_>, vm: &mmu::Vm) -> Result<KernelObject> {
-        KernelObject::new(
+        let state = KernelObject::new(
             alloc.dev,
             vm,
             crate::g17::object::Placement::In(dynamic::CLIENT_LOWER, cfg::TVB_PAGE),
             storage::STATE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
-        )
+        )?;
+        state.classify_memory(KernelCategory::RenderGeneration);
+        Ok(state)
     }
     fn new(alloc: &Allocator<'_>, vm: &mmu::Vm, state: KernelObject) -> Result<KBox<Self>> {
         let deflake = buffer::compact_alias(
@@ -290,6 +295,7 @@ impl Generation {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        fragment.classify_memory(KernelCategory::RenderGeneration);
         let fragment_client = buffer::compact_alias(
             &fragment,
             vm,
@@ -347,7 +353,6 @@ impl Generation {
 }
 
 pub(super) struct Memory {
-    _fragment_view: mmu::KernelMapping,
     pub(super) graph: Graph,
     scratch: Compact,
     discard: Compact,
@@ -357,9 +362,6 @@ pub(super) struct Memory {
     pub(super) timestamps: KernelObject,
     pub(super) manager: buffer::Manager,
     pub(super) lifecycle: [fw::ObjectIds; 2],
-    // The extra client views retain their allocation positions even though
-    // kick entries consume the register arrays embedded in the descriptors.
-    registers: KernelObject,
     pub(super) context: Arc<Context>,
     pub(super) installed_pool: Option<u8>,
 }
@@ -430,22 +432,6 @@ impl Memory {
                 word,
             )
         })?;
-        let registers = KernelObject::new(
-            alloc.dev,
-            vm,
-            crate::g17::object::Placement::In(dynamic::CLIENT_LOWER, mmu::UAT_PGSZ as u64),
-            mmu::UAT_PGSZ,
-            mmu::PROT_GPU_SHARED_RO,
-            CpuMap::WriteCombined,
-        )?;
-        let fragment_view = graph.descriptors.map_range(
-            vm,
-            TA_BYTES..TA_BYTES + mmu::UAT_PGSZ,
-            dynamic::CLIENT_LOWER,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_SHARED_RO,
-            0,
-        )?;
         Ok((
             storage.write_init(kernel::try_init!(Self {
                 graph,
@@ -457,8 +443,6 @@ impl Memory {
                 timestamps,
                 manager,
                 lifecycle: [tiling, fragment],
-                _fragment_view: fragment_view,
-                registers: registers,
                 context,
                 installed_pool: None,
             }))?,
@@ -542,21 +526,9 @@ impl Memory {
             (&mut *tiling).write(args)?;
             let fragment = &mut *fragment;
             fragment.write(args)?;
-            self.registers.bytes_mut().fill(0);
-            for (index, array) in fragment.descriptor.arrays.iter().enumerate() {
-                for (entry, value) in array
-                    .entries
-                    .get(..(array.size & 0xffff) as usize)
-                    .ok_or(EINVAL)?
-                    .iter()
-                    .enumerate()
-                {
-                    self.registers.write(
-                        index * size_of::<fw::kick::RegisterArray>()
-                            + entry * size_of::<fw::kick::RegisterWrite>(),
-                        *value,
-                    )?;
-                }
+            // Kick records use the arrays embedded in this descriptor directly.
+            for array in &fragment.descriptor.arrays {
+                array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
             }
             fragment.set_mcache(
                 args.fragment.descriptor_va,
@@ -609,15 +581,13 @@ impl Memory {
     ) -> Result<KVec<mmu::KernelMapping>> {
         if self.scratch.mapping.is_none()
             || self.discard.mapping.is_none()
-            || self.registers.gpu_va() == 0
         {
             return Err(EIO);
         }
         let mut aliases = KVec::new();
-        aliases.reserve(tvb.len().checked_add(3).ok_or(EOVERFLOW)?, GFP_KERNEL)?;
+        aliases.reserve(tvb.len().checked_add(2).ok_or(EOVERFLOW)?, GFP_KERNEL)?;
         aliases.push(self.scratch.mapping.take().ok_or(EIO)?, GFP_KERNEL)?;
         aliases.push(self.discard.mapping.take().ok_or(EIO)?, GFP_KERNEL)?;
-        aliases.push(self.registers.take_mapping()?, GFP_KERNEL)?;
         for mapping in core::mem::take(tvb) {
             aliases.push(mapping, GFP_KERNEL)?;
         }

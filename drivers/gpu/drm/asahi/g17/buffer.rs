@@ -379,6 +379,7 @@ impl Tvb {
             return Err(ERANGE);
         }
         let backing = KernelObject::backing(dev, Self::bytes(blocks)?, CpuMap::WriteCombined)?;
+        backing.classify_memory(crate::agx_memory_stats::KernelCategory::TileBuffer);
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
@@ -430,6 +431,7 @@ impl Tvb {
         self.extensions.reserve(1, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
         let backing = KernelObject::backing(dev, Self::bytes(added)?, CpuMap::WriteCombined)?;
+        backing.classify_memory(crate::agx_memory_stats::KernelCategory::TileBuffer);
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
         for relative in 0..added {

@@ -824,6 +824,7 @@ pub(crate) struct Gpu {
     geometry: mmu::UatGeometry,
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
+    _memory: Pin<KBox<kernel::debugfs::File<crate::agx_memory_stats::View>>>,
 }
 
 impl Gpu {
@@ -882,6 +883,11 @@ impl Gpu {
             GFP_KERNEL,
         )?;
 
+        let directory = kernel::debugfs::Dir::new(c"asahi-g17");
+        let memory = KBox::pin_init(
+            directory.read_only_file(c"memory", crate::agx_memory_stats::View),
+            GFP_KERNEL,
+        )?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -890,6 +896,7 @@ impl Gpu {
                 geometry,
                 ids: Default::default(),
                 shared,
+                _memory: memory,
             },
             GFP_KERNEL,
         )?;

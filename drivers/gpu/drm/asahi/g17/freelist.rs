@@ -82,6 +82,7 @@ impl Pages {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        backing.classify_memory(crate::agx_memory_stats::KernelCategory::FreeList);
         let base = backing.gpu_va();
         backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, layout))?;
         Ok(Self {
