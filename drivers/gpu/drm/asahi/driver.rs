@@ -5,7 +5,6 @@
 use crate::module_parameters;
 use kernel::bindings;
 use kernel::{
-    c_str,
     device::{
         Core,
         DeviceContext, //
@@ -333,14 +332,19 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
-        // G17's firmware channel format has no supported stats decoder yet.
+        // Enabled G17 telemetry owns agx_stats through Gpu's registration.
+        // Only the disabled-export placeholder belongs to the platform wrapper.
         let raw_dev = pdev.as_ref().as_raw();
-        let raw_stats = match crate::sysfs_exports::register(raw_dev, core::ptr::null(), false) {
-            Ok(handle) => handle,
-            Err(error) => {
-                gpu.shutdown();
-                return Err(error);
+        let raw_stats = if *module_parameters::stats_export.value() == 0 {
+            match crate::sysfs_exports::register(raw_dev, core::ptr::null(), false) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    gpu.shutdown();
+                    return Err(error);
+                }
             }
+        } else {
+            core::ptr::null_mut()
         };
         Ok(AsahiPlatformDriverData {
             _device: reg.device().into(),

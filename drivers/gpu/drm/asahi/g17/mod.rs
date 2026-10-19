@@ -42,6 +42,9 @@ mod queue;
 mod recovery;
 mod runtime;
 pub(crate) mod status;
+mod statistics;
+mod load;
+mod telemetry;
 mod teardown;
 mod timeout;
 mod validation;
@@ -611,6 +614,7 @@ struct Shared {
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
+    statistics: Arc<statistics::Statistics>,
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
     preparations: Arc<preparation::Gate>,
@@ -791,6 +795,7 @@ impl Shared {
 
     /// Marks the device lost without a crash log.
     fn lose_device_quietly(self: &Arc<Self>) {
+        self.statistics.load.invalidate();
         self.preparations.fail();
         if !self.crashed.swap(true, Ordering::AcqRel) {
             dev_err!(self.dev.as_ref(), "GPU runtime stopped, device lost\n");
@@ -802,6 +807,7 @@ impl Shared {
     ///
     /// The firmware cannot be restarted: outstanding and future work fails.
     fn lose_device(self: &Arc<Self>, role: Role, crashlog: Option<&[u8]>) {
+        self.statistics.load.invalidate();
         self.preparations.fail();
         self.crashed.store(true, Ordering::Release);
         dev_err!(
@@ -825,6 +831,35 @@ pub(crate) struct Gpu {
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
     _memory: Pin<KBox<kernel::debugfs::File<crate::agx_memory_stats::View>>>,
+    _statistics: Pin<KBox<kernel::debugfs::File<StatisticsView>>>,
+    _telemetry: Option<telemetry::Telemetry>,
+}
+
+struct StatisticsView(Arc<statistics::Statistics>);
+
+impl kernel::debugfs::Writer for StatisticsView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.0.request_capture(now_ns());
+        writeln!(f, "version=2 payload=raw_firmware_words received_clock=monotonic_ns capture_window_ns={}", statistics::CAPTURE_NS)?;
+        for role in 0..2 {
+            for tag in 16..=30 {
+                let Some(report) = self.0.snapshot(role, tag) else {
+                    writeln!(f, "role={} tag={:#x} busy=1", role, tag)?;
+                    continue;
+                };
+                if report.count == 0 {
+                    continue;
+                }
+                write!(f, "role={} tag={:#x} count={} received_ns={} words=",
+                       role, tag, report.count, report.received_ns)?;
+                for word in report.words {
+                    write!(f, "{:08x} ", word)?;
+                }
+                writeln!(f)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Gpu {
@@ -858,6 +893,19 @@ impl Gpu {
         let preparations = preparation::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
+        let statistics = Arc::new(statistics::Statistics::new(), GFP_KERNEL)?;
+        let report_statistics = statistics.clone();
+        let telemetry = if *crate::module_parameters::stats_export.value() == 0 {
+            None
+        } else {
+            match telemetry::Telemetry::new(pdev.as_ref(), statistics.clone()) {
+                Ok(telemetry) => Some(telemetry),
+                Err(error) => {
+                    dev_warn!(pdev.as_ref(), "GPU telemetry registration failed: {:?}\n", error);
+                    None
+                }
+            }
+        };
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let shared = Arc::pin_init(
             pin_init!(Shared {
@@ -868,6 +916,7 @@ impl Gpu {
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
                 feed,
+                statistics,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
                 work <- new_work!("g17::Shared::work"),
@@ -888,6 +937,10 @@ impl Gpu {
             directory.read_only_file(c"memory", crate::agx_memory_stats::View),
             GFP_KERNEL,
         )?;
+        let statistics = KBox::pin_init(
+            directory.read_only_file(c"statistics", StatisticsView(report_statistics)),
+            GFP_KERNEL,
+        )?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -897,6 +950,8 @@ impl Gpu {
                 ids: Default::default(),
                 shared,
                 _memory: memory,
+                _statistics: statistics,
+                _telemetry: telemetry,
             },
             GFP_KERNEL,
         )?;
@@ -1036,6 +1091,7 @@ impl Gpu {
 
     /// Stops the firmware and releases everything it used.
     pub(crate) fn shutdown(&self) {
+        self.shared.statistics.load.invalidate();
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();

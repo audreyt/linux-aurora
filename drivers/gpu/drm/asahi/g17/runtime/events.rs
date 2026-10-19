@@ -34,7 +34,8 @@ impl event::Transport for Service<'_> {
         let firmware = &mut self.firmware;
         firmware
             .rings
-            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
+            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role,
+                              &firmware.primary.state.shared.statistics);
     }
     fn drain(
         &mut self,
