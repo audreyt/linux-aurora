@@ -115,18 +115,20 @@ impl State {
         }
         // Prefer the owner's idle pair. A missing sibling can be claimed
         // only while this owner has no live kick, before constructing it.
-        for slot in 0..cfg::RENDER_SLOTS {
-            if self.owners[slot] == owner
-                && self.refs[slot] == 0
-                && self.quarantined & (1u64 << slot) == 0
+        let idle = (0..cfg::RENDER_SLOTS)
+            .filter(|slot| {
+                self.owners[*slot] == owner
+                    && self.refs[*slot] == 0
+                    && self.quarantined & (1u64 << slot) == 0
+            })
+            .max_by_key(|slot| (self.epochs[*slot], usize::MAX - *slot));
+        if let Some(slot) = idle {
+            if !(0..cfg::RENDER_SLOTS)
+                .any(|other| self.owners[other] == owner && self.refs[other] != 0)
             {
-                if !(0..cfg::RENDER_SLOTS)
-                    .any(|other| self.owners[other] == owner && self.refs[other] != 0)
-                {
-                    self.claim_sibling(owner);
-                }
-                return Some(self.take_idle(slot, owner));
+                self.claim_sibling(owner);
             }
+            return Some(self.take_idle(slot, owner));
         }
         if self.owners.contains(&owner) {
             // Consecutive kicks are ordered by firmware dependencies. Stack
@@ -175,8 +177,51 @@ impl State {
         if let Some(slot) = sibling {
             self.released &= !(1u64 << slot);
             self.owners[slot] = owner;
-            self.advance(slot);
+            // A speculative sibling has no GPU-use recency yet.
+            self.epochs[slot] = 0;
         }
+    }
+
+    /// The device lock separately proves the physical graph was never published.
+    /// An open owner keeps another usable pair. Exclude every live borrower,
+    /// including off-lock sibling construction; a closed owner needs no spare.
+    fn reassign_unused_spare(
+        &mut self,
+        slot: u8,
+        expected: Option<u64>,
+        owner: Option<u64>,
+    ) -> bool {
+        let slot = usize::from(slot);
+        if slot == 0
+            || slot >= cfg::RENDER_SLOTS
+            || owner.is_some_and(|owner| {
+                owner == 0
+                    || self.owners.iter().filter(|value| **value == owner).count()
+                        >= cfg::RENDER_PAIRS_PER_OWNER
+            })
+        {
+            return false;
+        }
+        let bit = 1u64 << slot;
+        let old = self.owners[slot];
+        if old == 0
+            || owner == Some(old)
+            || expected.is_some_and(|expected| expected != old)
+            || self.refs[slot] != 0
+            || (self.active | self.quarantined | self.kill_hold) & bit != 0
+            || (self.released & bit == 0
+                && !self.owners.iter().enumerate().any(|(other, value)| {
+                    other != slot
+                        && *value == old
+                        && (self.quarantined | self.kill_hold) & (1u64 << other) == 0
+                }))
+        {
+            return false;
+        }
+        self.owners[slot] = owner.unwrap_or(0);
+        self.released &= !bit;
+        self.epochs[slot] = 0;
+        true
     }
     fn warmable_sibling(&self, owner: u64, publishing: u8) -> Option<u8> {
         if self.refs.get(usize::from(publishing)) != Some(&1) {
@@ -188,8 +233,30 @@ impl State {
                     && self.owners[*slot] == owner
                     && self.refs[*slot] == 0
                     && self.quarantined & (1u64 << slot) == 0
+                    && self.released & (1u64 << slot) == 0
             })
             .map(|slot| slot as u8)
+    }
+    fn borrow_warm_sibling(&mut self, owner: u64, publishing: u8) -> Option<u8> {
+        let slot = self.warmable_sibling(owner, publishing)?;
+        self.refs[usize::from(slot)] += 1;
+        self.active |= 1u64 << slot;
+        Some(slot)
+    }
+    fn cancel_empty_slot(&mut self, slot: u8, owner: u64) -> bool {
+        let slot = usize::from(slot);
+        let bit = 1u64 << slot;
+        if self.owners[slot] == owner
+            && self.refs[slot] == 1
+            && (self.quarantined | self.kill_hold) & bit == 0
+        {
+            self.owners[slot] = 0;
+            self.released &= !bit;
+            self.epochs[slot] = 0;
+            true
+        } else {
+            false
+        }
     }
     fn plan(&self, owner: u64, request: Option<Request<'_>>, ticket: Option<u64>) -> Plan {
         let Some(request) = request else {
@@ -420,8 +487,33 @@ impl Pool {
             record,
         }))
     }
-    pub(crate) fn warmable_sibling(&self, owner: u64, publishing: u8) -> Option<u8> {
-        self.state.lock().warmable_sibling(owner, publishing)
+    pub(crate) fn warmable_sibling(
+        self: &Arc<Self>,
+        owner: u64,
+        publishing: u8,
+    ) -> Option<RenderLease> {
+        let mut state = self.state.lock();
+        let slot = state.borrow_warm_sibling(owner, publishing)?;
+        // This is a host construction borrower, not a GPU-use epoch. In
+        // particular it must not clear a logical close or age an unused spare.
+        Some(RenderLease {
+            pool: self.clone(),
+            slot,
+            record: None,
+        })
+    }
+    pub(crate) fn reassign_unused_spare(
+        &self,
+        slot: u8,
+        expected: Option<u64>,
+        owner: Option<u64>,
+    ) -> bool {
+        self.state
+            .lock()
+            .reassign_unused_spare(slot, expected, owner)
+    }
+    pub(crate) fn owns_slot(&self, owner: u64, slot: usize) -> bool {
+        self.state.lock().owners.get(slot) == Some(&owner)
     }
     pub(crate) fn release_owner(&self, owner: u64) {
         let mut state = self.state.lock();
@@ -468,6 +560,17 @@ pub(crate) struct RenderLease {
     record: Option<(u64, u64)>,
 }
 impl RenderLease {
+    /// The device lock proves this slot has no physical identities or graph.
+    /// Give back an unbound reservation before retrying on a retained channel.
+    pub(crate) fn cancel_empty(self, owner: u64) -> bool {
+        let cancelled = {
+            let mut state = self.pool.state.lock();
+            state.cancel_empty_slot(self.slot, owner)
+        };
+        drop(self);
+        cancelled
+    }
+
     pub(crate) fn slot(&self) -> u8 {
         self.slot
     }

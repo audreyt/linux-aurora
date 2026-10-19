@@ -152,6 +152,7 @@ pub(crate) struct Pair {
     owner: Option<u64>,
     ordinal: u64,
     initial_packet: u64,
+    graph_started: bool,
     clusters: u32,
     descriptor_flags: [u32; 2],
     installed: [bool; 2],
@@ -239,6 +240,7 @@ impl Pair {
             owner: Some(owner),
             ordinal: 0,
             initial_packet: first.id,
+            graph_started: false,
             clusters,
             descriptor_flags,
             installed: [false; 2],
@@ -503,9 +505,17 @@ impl Pair {
         };
         use core::sync::atomic::{fence, Ordering};
         let (epoch, mcache, policy) = self.publication_preflight(&packet, host)?;
+        self.graph_started = true;
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let qids = self.qids();
+        let kick_ids = self.kicks.each_ref().map(kick::Queue::id);
+        // Command preparation assigns context channel state before publishing
+        // producers. Pin identities before that assignment; warming never
+        // enters this path and can still give its unused identities back.
+        for id in kick_ids {
+            host.publish_qid(id)?;
+        }
         let kicks = self.kicks.each_ref().map(kick::Queue::timestamp);
         let parents = self.kicks.each_ref().map(kick::Queue::parent);
         let work = packet.completion.work_state()?;
@@ -729,9 +739,6 @@ impl Pair {
             if self.registered != Some(policy.priority()) {
                 host.install_pair(&registration)?;
                 self.registered = Some(policy.priority());
-            }
-            for kick in &self.kicks {
-                host.publish_qid(kick.id())?;
             }
             host.publish_outer_pair(
                 policy.priority(),
@@ -1736,6 +1743,7 @@ impl Pair {
         self.memory.context = binding.context.clone();
         self.owner = Some(binding.owner);
         self.initial_packet = binding.initial_packet;
+        if foreign { self.graph_started = false; }
         self.context_update = true;
         if foreign {
             self.cursors = [0; 2];

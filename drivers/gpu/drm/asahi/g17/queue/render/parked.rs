@@ -48,11 +48,20 @@ pub(crate) struct Prepared {
 }
 
 impl Pair {
+    /// The current graph never entered command publication. Physical identities
+    /// may have older users; parking retains their rings and retirement owners.
+    pub(crate) fn can_yield_unused(&self) -> Result<bool> {
+        Ok(!self.graph_started && self.can_park_backing(self.context())?)
+    }
+
     /// The registry also checks the shared free-list release and scheduler-release witness.
     /// Drain displaced owners before this preflight; they have their own logical releases.
     pub(crate) fn can_park(&self, context: &Arc<Context>) -> Result<bool> {
+        Ok(self.owner.is_none() && self.can_park_backing(context)?)
+    }
+
+    fn can_park_backing(&self, context: &Arc<Context>) -> Result<bool> {
         Ok(Arc::ptr_eq(context, self.context())
-            && self.owner.is_none()
             && self
                 .previous
                 .as_ref()
@@ -190,6 +199,7 @@ impl ParkedPair {
             return Err(EIO);
         };
         storage.write_init(kernel::try_init!(Pair {
+            graph_started: false,
             kick_aliases: None,
             memory,
             kicks,

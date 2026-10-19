@@ -568,9 +568,11 @@ impl super::super::Backend {
                 .warmable_sibling(self.owner, slot)
         };
         if let Some(sibling) = sibling {
+            // The host lease excludes capacity reclamation until this off-lock
+            // construction and its final device-locked install have finished.
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
-            match self.build_render_pair(sibling, packet, true) {
+            match self.build_render_pair(sibling.slot(), packet, true) {
                 Err(error) if error == EBUSY || error == EAGAIN => {}
                 result => result?,
             }

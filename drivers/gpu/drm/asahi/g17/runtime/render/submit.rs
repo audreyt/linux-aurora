@@ -23,6 +23,83 @@ impl Backend {
         self.render_with_lease(packet, None, deferred)
     }
 
+    /// Reserve identities before attaching a lease to the packet. An empty
+    /// logical slot must not hide reusable physical channels when the shared
+    /// queue-ID namespace is full.
+    fn acquire_render_with_ids(
+        &self,
+        packet: &Arc<Packet>,
+        mut next: Option<RenderLease>,
+    ) -> Result<RenderLease> {
+        let pool = {
+            let state = self.shared.state.lock();
+            (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
+        };
+        loop {
+            if packet.cancel_requested() {
+                return Err(ECANCELED);
+            }
+            if packet.completion.status().get() != 0 {
+                return Err(EIO);
+            }
+            let lease = if let Some(lease) = next.take() {
+                lease
+            } else {
+                match pool.acquire_render(self.owner, Request::of(packet)) {
+                    Ok(lease) => lease,
+                    Err(error) if error == ENOSPC => {
+                        let reclaimed = {
+                            let mut state = self.shared.state.lock();
+                            (*state)
+                                .as_deref_mut()
+                                .ok_or(ENODEV)?
+                                .queues
+                                .reclaim_unused_render_spare(Some(self.owner), false)?
+                        };
+                        if reclaimed.is_none() {
+                            return Err(error);
+                        }
+                        drop(reclaimed);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let slot = lease.slot();
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            match firmware.queues.ensure_render_ids(slot, self.owner) {
+                Ok(()) => return Ok(lease),
+                Err(error) if error == ENOSPC => {
+                    let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
+                    if reclaimed.is_some() {
+                        drop(state);
+                        drop(reclaimed);
+                        next = Some(lease);
+                        continue;
+                    }
+                    // ensure_render_ids leaves no partial entry on refusal.
+                    if firmware.queues.render.entries[usize::from(slot)].is_some() {
+                        return Err(error);
+                    }
+                    if !lease.cancel_empty(self.owner) {
+                        continue;
+                    }
+                    let reclaimed = firmware
+                        .queues
+                        .reclaim_unused_render_spare(Some(self.owner), true)?;
+                    let ready = firmware.queues.has_render_ids(self.owner);
+                    drop(state);
+                    if reclaimed.is_none() && !ready {
+                        return Err(error);
+                    }
+                    drop(reclaimed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn render_with_lease(
         &self,
         packet: &Arc<Packet>,
@@ -37,16 +114,7 @@ impl Backend {
             return Err(EIO);
         }
         let interruptible = early.is_none();
-        let admission = match early {
-            Some(lease) => lease,
-            None => {
-                let pool = {
-                    let state = self.shared.state.lock();
-                    (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
-                };
-                pool.acquire_render(self.owner, Request::of(packet))?
-            }
-        };
+        let admission = self.acquire_render_with_ids(packet, early)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
         let mut state_polls = 0;

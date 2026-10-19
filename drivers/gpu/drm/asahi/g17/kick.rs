@@ -17,7 +17,7 @@ use crate::{hw::t8140, mem, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
-/// QIDs kept free for render pairs when compute queues fill the table.
+/// Minimum render-channel capacity protected from compute-only allocation.
 const COMPUTE_RENDER_RESERVE: usize = 16;
 
 /// Stable physical-channel identity. The owner must not be reused within a
@@ -83,10 +83,21 @@ impl QueueIds {
                 Err(EINVAL)
             };
         }
-        // Healthy existing channels keep their QID. Never recycle a published
-        // identity to recover capacity after a fault; leave eight render pairs.
-        if engine == DataMaster::Compute && QID_COUNT - self.leased <= COMPUTE_RENDER_RESERVE {
-            return Err(ENOSPC);
+        // Existing render identities already satisfy this reservation. Counting
+        // them twice can refuse compute even while physical QIDs remain free.
+        // Published identities always retain their original lifetime rules.
+        if engine == DataMaster::Compute {
+            let render = self
+                .entries
+                .iter()
+                .flatten()
+                .filter(|entry| {
+                    matches!(entry.id.engine, DataMaster::Tiling | DataMaster::Fragment)
+                })
+                .count();
+            if QID_COUNT - self.leased <= COMPUTE_RENDER_RESERVE.saturating_sub(render) {
+                return Err(ENOSPC);
+            }
         }
         let index = preferred
             .map(usize::from)
@@ -125,6 +136,13 @@ impl QueueIds {
         }
         entry.published = true;
         Ok(())
+    }
+
+    pub(crate) fn can_cancel_unpublished(&self, id: Id) -> bool {
+        self.entries
+            .get(usize::from(id.qid))
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| entry.id == id && !entry.published)
     }
 
     pub(crate) fn cancel_unpublished(&mut self, id: Id) -> Result {

@@ -624,7 +624,19 @@ impl Backend {
                     Rebind::Grow => { drop(state); return self.grow_compute(required); }
                     Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
                     Rebind::Fresh => {
-                        let reservation = firmware.queues.reserve_compute(self.owner)?;
+                        let reservation = match firmware.queues.reserve_compute(self.owner) {
+                            Ok(reservation) => reservation,
+                            Err(error) if error == ENOSPC => {
+                                let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
+                                drop(state);
+                                if reclaimed.is_none() {
+                                    return Err(error);
+                                }
+                                drop(reclaimed);
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         (firmware.uat.clone(), Ok(reservation))
                     }
                 }
