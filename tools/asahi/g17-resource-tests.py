@@ -123,9 +123,9 @@ def queue_tests(root, source):
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] enum DataMaster {Compute,Tiling,Fragment}
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] struct Id {qid:u8,owner:u64,engine:DataMaster}
     #[derive(Clone,Copy)] struct Identity {id:Id,published:bool}
-    '''+constants+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name)+'\n' for name in ['reserve','publish','can_cancel_unpublished','cancel_unpublished'])+'}\n'
+    '''+constants+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','publish','can_cancel_unpublished','cancel_unpublished'])+'}\n'
     test='''
-    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],compute_publication:0,leased:0}}
+    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],compute_publication:0,leased:0}}
     fn main(){
      for render in [0,2,16,32,112,126] {
       let mut q=fresh();
@@ -141,6 +141,41 @@ def queue_tests(root, source):
      let next=q.reserve(3,DataMaster::Fragment,None).unwrap();assert_eq!(next.qid,unused.qid);
      assert!(!q.can_cancel_unpublished(unused));assert_eq!(q.cancel_unpublished(unused),Err(EINVAL));
      println!("queue IDs: six render/compute capacity boundaries; compute-only render reserve retained; published and stale identities protected");
+     // Reproduce the hardware snapshot: 124 installed render identities, two
+     // installed compute identities, and two initial reservations fill128 IDs.
+     let mut q=fresh();q.reserve_initial_render().unwrap();
+     assert_eq!(q.reserve_initial_render(),Err(EINVAL));
+     let initial=q.initial_render;
+     for owner in 1000..1002 {let id=q.reserve(owner,DataMaster::Compute,Some(4)).unwrap();q.publish(id).unwrap();}
+     let mut installed=Vec::new();
+     for owner in 3..127 {let id=q.reserve(owner,if owner%2==0 {DataMaster::Tiling}else{DataMaster::Fragment},None).unwrap();q.publish(id).unwrap();installed.push(id);}
+     assert_eq!(q.leased,QID_COUNT);
+     for (n,old) in initial.into_iter().enumerate() {
+      let old=old.unwrap();let id=q.reserve(2000+n as u64,DataMaster::Compute,None).unwrap();
+      assert_eq!(id.qid,old.qid);assert_eq!(q.leased,QID_COUNT);
+      assert!(!q.can_cancel_unpublished(old));assert_eq!(q.cancel_unpublished(old),Err(EINVAL));
+      q.publish(id).unwrap();
+     }
+     assert_eq!(q.reserve(3000,DataMaster::Compute,None),Err(ENOSPC));
+     for id in installed {assert!(!q.can_cancel_unpublished(id));assert_eq!(q.entries[id.qid as usize].unwrap().id,id);}
+     // A bootstrap token that became published is never replaced.
+     let mut q=fresh();q.reserve_initial_render().unwrap();let protected=q.initial_render[0].unwrap();q.publish(protected).unwrap();
+     for owner in 3..129 {q.reserve(owner,DataMaster::Tiling,None).unwrap();}
+     assert_eq!(q.leased,QID_COUNT);
+     assert_eq!(q.reserve(1000,DataMaster::Compute,None).unwrap().qid,1);
+     assert_eq!(q.reserve(1001,DataMaster::Compute,None),Err(ENOSPC));
+     assert_eq!(q.entries[0].unwrap().id,protected);
+     // Replacement must not consume the protected render minimum.
+     let mut q=fresh();q.reserve_initial_render().unwrap();
+     for owner in 3..17 {q.reserve(owner,DataMaster::Tiling,None).unwrap();}
+     for owner in 1000..1112 {q.reserve(owner,DataMaster::Compute,None).unwrap();}
+     assert_eq!(q.leased,QID_COUNT);assert_eq!(q.reserve(2000,DataMaster::Compute,None),Err(ENOSPC));
+     assert!(q.initial_render.iter().all(Option::is_some));
+     // Ordinary free capacity leaves the initialization reservations untouched.
+     let mut q=fresh();q.reserve_initial_render().unwrap();let initial=q.initial_render;
+     let id=q.reserve(1000,DataMaster::Compute,Some(4)).unwrap();assert_eq!(id.qid,4);assert_eq!(q.initial_render,initial);
+     println!("initial reservations: full-namespace compute admission restored; physical count unchanged; published and stale identities plus render minimum protected");
+
     }
     '''
     fixture=root/'queue-id-capacity-controls.rs';fixture.write_text(header+test)

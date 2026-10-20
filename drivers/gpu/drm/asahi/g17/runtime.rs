@@ -74,9 +74,7 @@ impl Registry {
     ) -> impl Init<Self, Error> {
         kernel::try_init!(Self {
             qids <- kick::QueueIds::new().chain(|qids| {
-                qids.reserve(1, DataMaster::Tiling, Some(0))?;
-                qids.reserve(2, DataMaster::Fragment, Some(1))?;
-                Ok(())
+                qids.reserve_initial_render()
             }),
             buffers <- BufferIds::new(),
             accounting: qos::Accounting::new(),
