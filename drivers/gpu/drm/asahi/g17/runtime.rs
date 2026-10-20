@@ -273,6 +273,20 @@ impl Registry {
         Ok(freed)
     }
 
+    /// A retained queue in a pool-release transaction temporarily cannot bind.
+    /// Distinguish that state from permanent physical-identity exhaustion.
+    fn compute_admission_error(&self, error: Error) -> Error {
+        if error == ENOSPC
+            && self.compute.iter().flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.pool_release_pending())
+        {
+            EAGAIN
+        } else {
+            error
+        }
+    }
+
     pub(super) fn reserve_compute(&mut self, owner: u64) -> Result<ComputeReservation> {
         if owner == 0
             || self.compute.iter().flatten().any(|entry| {
@@ -294,7 +308,8 @@ impl Registry {
         let identity = self.identities.reserve(1)?.start;
         let id = self
             .qids
-            .reserve(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID))?;
+            .reserve(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID))
+            .map_err(|error| self.compute_admission_error(error))?;
         let reservation = ComputeReservation { slot, id, owner };
         self.compute[slot] = Some(ComputeEntry {
             reservation,
@@ -595,6 +610,8 @@ impl Backend {
     }
 
     fn build_compute(&self, required: usize) -> Result {
+        const POOL_RELEASE_WAIT_NS: u64 = 200_000_000;
+        let mut pool_release_wait = None;
         loop {
             match self.shared_compute() {
                 Err(error) if error == EAGAIN => continue,
@@ -624,6 +641,19 @@ impl Backend {
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
                             Ok(reservation) => reservation,
+                            Err(error) if error == EAGAIN => {
+                                // The event worker owns release observation and
+                                // drops vacated aliases/backing off this mutex.
+                                let since = *pool_release_wait.get_or_insert(now_ns());
+                                drop(state);
+                                drop(lease);
+                                self.shared.queue_events();
+                                if now_ns().saturating_sub(since) >= POOL_RELEASE_WAIT_NS {
+                                    return Err(EBUSY);
+                                }
+                                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                                continue;
+                            }
                             Err(error) if error == ENOSPC => {
                                 let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
                                 drop(state);

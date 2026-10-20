@@ -420,7 +420,7 @@ impl crate::g17::Shared {
                 .iter()
                 .flatten()
                 .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling());
+                .any(|queue| queue.retirement_polling() || queue.pool_release_pending());
         if polling {
             self.queue_poll();
         }

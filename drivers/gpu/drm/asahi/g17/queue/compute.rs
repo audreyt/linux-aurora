@@ -626,6 +626,12 @@ impl Queue {
         !self.quarantined && self.retire_pending
     }
 
+    /// A release has no completion event: keep observing the control consumer
+    /// until its witness lets the idle physical queue be re-armed.
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+    }
+
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
         self.retired_by_teardown
             || self.retire_pending
