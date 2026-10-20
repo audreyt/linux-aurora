@@ -207,7 +207,151 @@ def queue_tests(root, source):
     subprocess.run([os.environ.get('RUSTC', 'rustc'),'--edition=2021',str(fixture),'-o',str(root/'unused-render-guard-controls')],check=True)
     subprocess.run([str(root/'unused-render-guard-controls')],check=True)
 
+def shared_alias_tests(root, source):
+    s=(source/'g17/object.rs').read_text()
+    at=s.index('    pub(crate) fn lower_with_aliases(');begin=s.index('{',at);end=begin+1;depth=1
+    while depth:
+        depth+=(s[end]=='{')-(s[end]=='}');end+=1
+    method=s[at:end]
+    fixture=root/'shared-alias-controls.rs'
+    fixture.write_text('''#![allow(dead_code)]
+use std::{cell::RefCell,rc::Rc,ops::Range};
+type Result<T> = std::result::Result<T,i32>;type Error=i32;
+const EINVAL:i32=-22;const EOVERFLOW:i32=-75;const ENOSPC:i32=-28;const EIO:i32=-5;
+mod hw {pub mod t8140 {pub mod dynamic {pub const LOWER:std::ops::Range<u64>=0..256;}}}
+mod mmu {pub const UAT_PGSZ:usize=16;pub type Prot=u8;pub type Vm=super::Vm;pub type KernelMapping=super::Mapping;}
+#[derive(Clone,Copy)] enum CpuMap {WriteCombined}
+#[derive(Clone)] struct Region {vm:usize,start:u64,size:u64,object:u64}
+#[derive(Default)] struct State {regions:Vec<Region>,allocations:u64,attempts:usize,fault:Option<usize>}
+struct Vm {id:usize,state:Rc<RefCell<State>>}
+struct Uat {lower:Vm}
+impl Uat {fn kernel_lower_vm(&self)->&Vm {&self.lower}}
+struct Device {state:Rc<RefCell<State>>}
+struct Mapping {vm:usize,address:u64,size:u64,object:u64,state:Rc<RefCell<State>>}
+impl Mapping {fn iova(&self)->u64 {self.address}}
+impl Drop for Mapping {fn drop(&mut self) {
+ let mut state=self.state.borrow_mut();
+ if self.vm==0 {assert!(!state.regions.iter().any(|r|r.vm!=0&&r.object==self.object&&r.start==self.address),"aliases must retire before canonical reservation");}
+ let index=state.regions.iter().position(|r|r.vm==self.vm&&r.start==self.address&&r.object==self.object).unwrap();
+ state.regions.remove(index);
+}}
+fn overlaps(s:&State,vm:usize,start:u64,size:u64)->bool {s.regions.iter().any(|r|r.vm==vm&&r.start<start+size&&start<r.start+r.size)}
+fn claim(vm:&Vm,address:u64,size:u64,object:u64)->Result<Mapping> {
+ let mut state=vm.state.borrow_mut();
+ if state.fault==Some(vm.id) {return Err(EIO)}
+ if overlaps(&state,vm.id,address,size) {return Err(ENOSPC)}
+ state.regions.push(Region {vm:vm.id,start:address,size,object});
+ Ok(Mapping {vm:vm.id,address,size,object,state:vm.state.clone()})
+}
+struct ObjectRef {id:u64,size:usize}
+impl ObjectRef {
+ fn map_mode(&self,vm:&Vm,range:Range<u64>,align:u64,guard:bool,lowest:bool)->Result<Mapping> {
+  if vm.id==0 {assert!(guard,"canonical guard must be preserved");vm.state.borrow_mut().attempts+=1;}
+  let length=self.size as u64+if guard {16}else{0};
+  let mut used:Vec<_>=vm.state.borrow().regions.iter().filter(|r|r.vm==vm.id).cloned().collect();used.sort_by_key(|r|r.start);
+  let mut cursor=range.start;let mut holes=Vec::new();
+  for r in used {
+   if r.start>cursor {holes.push(cursor..r.start.min(range.end));}
+   cursor=cursor.max(r.start+r.size);
+  }
+  if cursor<range.end {holes.push(cursor..range.end);}
+  let choice=holes.into_iter().filter_map(|h| {
+   let address=h.start.div_ceil(align)*align;
+   (address+length<=h.end).then_some((if lowest {address}else{h.end-h.start},address))
+  }).min();
+  match choice {Some((_,address))=>claim(vm,address,length,self.id),None=>Err(ENOSPC)}
+ }
+ fn map_into_range(&self,vm:&Vm,range:Range<u64>,align:u64,_prot:u8,guard:bool)->Result<Mapping> {
+  self.map_mode(vm,range,align,guard,false)
+ }
+}
+struct KernelObject {obj:ObjectRef,mapping:Option<Mapping>}
+impl KernelObject {
+ fn backing(dev:&Device,size:usize,_cpu:CpuMap)->Result<Self> {let mut s=dev.state.borrow_mut();s.allocations+=1;Ok(Self {obj:ObjectRef {id:s.allocations,size},mapping:None})}
+ fn map_alias(&self,vm:&Vm,address:u64,_prot:u8)->Result<Mapping> {claim(vm,address,self.obj.size as u64,self.obj.id)}
+ fn alias_in_lowest(&self,vm:&Vm,range:Range<u64>,align:u64,_prot:u8,guard:usize)->Result<Mapping> {self.obj.map_mode(vm,range,align,guard!=0,true)}
+}
+struct Allocator<'a> {dev:&'a Device,uat:&'a Uat}
+impl Allocator<'_> {
+'''+method+'''
+}
+fn case(obstacles:&[(usize,u64,u64)],fault:Option<usize>,size:usize,expected:std::result::Result<u64,i32>,attempts:usize) {
+ let state=Rc::new(RefCell::new(State::default()));
+ for (vm,start,len) in obstacles {state.borrow_mut().regions.push(Region {vm:*vm,start:*start,size:*len,object:0});}
+ state.borrow_mut().fault=fault;
+ let dev=Device {state:state.clone()};let uat=Uat {lower:Vm {id:0,state:state.clone()}};
+ let first=Vm {id:1,state:state.clone()};let second=Vm {id:2,state:state.clone()};
+ let alloc=Allocator {dev:&dev,uat:&uat};
+ let result=alloc.lower_with_aliases(size,16,3,CpuMap::WriteCombined,[&first,&second]);
+ match (expected,result) {
+  (Ok(address),Ok((object,aliases)))=>{
+   assert_eq!(object.mapping.as_ref().unwrap().iova(),address);
+   assert!(aliases.iter().all(|m|m.iova()==address&&m.object==object.obj.id));
+   assert_eq!(state.borrow().regions.iter().filter(|r|r.object!=0).count(),3);
+   drop(aliases);drop(object);
+  },
+  (Err(expected),Err(actual))=>assert_eq!(actual,expected),
+  _=>panic!("unexpected common-address placement result"),
+ }
+ assert_eq!(state.borrow().regions.len(),obstacles.len(),"failed attempts leak no reservations or aliases");
+ assert_eq!(state.borrow().allocations,if size==0||size%16!=0 {0}else{1},"all retries reuse one backing");
+ assert_eq!(state.borrow().attempts,attempts);
+}
+fn exhaustive_common_holes() {
+ for canonical in 0u32..64 {for global in 0u32..64 {for client in 0u32..64 {
+  let masks=[canonical,global,client];
+  let available=(0..4).any(|page|canonical&(7<<page)==0&&global&(3<<page)==0&&client&(3<<page)==0);
+  let state=Rc::new(RefCell::new(State::default()));
+  for (vm,mask) in masks.into_iter().enumerate() {
+   state.borrow_mut().regions.push(Region {vm,start:96,size:160,object:0});
+   for page in 0..6 {if mask&(1<<page)!=0 {state.borrow_mut().regions.push(Region {vm,start:page*16,size:16,object:0});}}
+  }
+  let original=state.borrow().regions.len();
+  let dev=Device {state:state.clone()};let uat=Uat {lower:Vm {id:0,state:state.clone()}};
+  let first=Vm {id:1,state:state.clone()};let second=Vm {id:2,state:state.clone()};
+  let alloc=Allocator {dev:&dev,uat:&uat};
+  match alloc.lower_with_aliases(32,16,3,CpuMap::WriteCombined,[&first,&second]) {
+   Ok((object,aliases))=>{
+    assert!(available,"allocator found a false common hole");
+    let address=object.mapping.as_ref().unwrap().iova();assert_eq!(address%16,0);let page=address/16;assert!(page<4);
+    assert!(canonical&(7<<page)==0&&global&(3<<page)==0&&client&(3<<page)==0);
+    assert!(aliases.iter().all(|m|m.iova()==address&&m.object==object.obj.id));
+    drop(aliases);drop(object);
+   },
+   Err(error)=>{assert_eq!(error,ENOSPC);assert!(!available,"allocator skipped a common hole");},
+  }
+  assert_eq!(state.borrow().allocations,1);assert_eq!(state.borrow().regions.len(),original);
+ }}}
+ println!("shared aliases: all262144 three-VM occupancy combinations match the independent common-hole oracle");
+}
+fn main() {
+ case(&[],None,64,Ok(0),1);
+ case(&[(1,0,16)],None,64,Ok(16),2);
+ case(&[(2,0,16)],None,64,Ok(16),2);
+ case(&[(1,0,16),(2,64,16)],None,64,Ok(80),3);
+ case(&[(0,0,16)],None,64,Ok(16),1);
+ case(&[(2,0,256)],None,64,Err(ENOSPC),1);
+ case(&[(2,0,176)],None,64,Ok(176),2);
+ case(&[],Some(1),64,Err(EIO),1);
+ case(&[],Some(2),64,Err(EIO),1);
+ case(&[],Some(0),64,Err(EIO),1);
+ case(&[],None,256,Err(ENOSPC),1);
+ case(&[],None,0,Err(EINVAL),0);
+ case(&[],None,15,Err(EINVAL),0);
+ // Best-fit initially selects the small late hole, occupied in the client.
+ // The larger earlier canonical hole must remain eligible after that collision.
+ case(&[(0,128,16),(2,144,112)],None,64,Ok(0),2);
+ case(&[(1,0,256)],None,64,Err(ENOSPC),1);
+ case(&[(0,128,128),(2,0,128)],None,64,Err(ENOSPC),2);
+ println!("shared aliases: 16 best-fit, collision, rollback, lifetime, backing-reuse, guard and error controls pass");
+ exhaustive_common_holes();
+}
+''')
+    subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021',str(fixture),'-o',str(root/'shared-alias-controls')],check=True)
+    subprocess.run([str(root/'shared-alias-controls')],check=True)
+
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='asahi-resource-tests-') as temporary:
         admission_tests(Path(temporary), DRIVER)
         queue_tests(Path(temporary), DRIVER)
+        shared_alias_tests(Path(temporary), DRIVER)

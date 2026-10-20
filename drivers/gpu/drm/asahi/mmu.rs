@@ -1860,6 +1860,37 @@ impl Vm {
         prot: Prot,
         guard_size: usize,
     ) -> Result<KernelMapping> {
+        self.map_in_range_with_mode(
+            gem, object_range, alignment, range, prot, guard_size, mm::InsertMode::Best,
+        )
+    }
+
+    /// Lowest-address placement for a monotonic search across several VMs.
+    pub(crate) fn map_in_range_lowest(
+        &self,
+        gem: &gem::Object,
+        object_range: Range<usize>,
+        alignment: u64,
+        range: Range<u64>,
+        prot: Prot,
+        guard_size: usize,
+    ) -> Result<KernelMapping> {
+        self.map_in_range_with_mode(
+            gem, object_range, alignment, range, prot, guard_size, mm::InsertMode::Low,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_in_range_with_mode(
+        &self,
+        gem: &gem::Object,
+        object_range: Range<usize>,
+        alignment: u64,
+        range: Range<u64>,
+        prot: Prot,
+        guard_size: usize,
+        mode: mm::InsertMode,
+    ) -> Result<KernelMapping> {
         use kernel::drm::gem::BaseObject;
         if guard_size % UAT_PGSZ != 0 {
             return Err(EINVAL);
@@ -1916,7 +1947,7 @@ impl Vm {
             0,
             range.start,
             range.end,
-            mm::InsertMode::Best,
+            mode,
         );
         let mut node = match result {
             Ok(node) => node,

@@ -76,12 +76,15 @@ pub(crate) struct Pages {
 }
 impl Pages {
     fn new(alloc: &Allocator<'_>, blocks: usize, layout: RunLayout) -> Result<Self> {
-        let mut backing = alloc.lower(
+        let backing = alloc.lower(
             TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        Self::from_backing(backing, blocks, layout)
+    }
+    fn from_backing(mut backing: KernelObject, blocks: usize, layout: RunLayout) -> Result<Self> {
         backing.classify_memory(crate::agx_memory_stats::KernelCategory::FreeList);
         let base = backing.gpu_va();
         backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, layout))?;
@@ -145,14 +148,14 @@ impl RenderBacking {
         if blocks < RENDER_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
             return Err(EINVAL);
         }
-        let pages = Pages::new(alloc, blocks, RunLayout::Render)?;
-        let address = pages.page_list_va();
-        let global = pages
-            .backing
-            .map_alias(render_global, address, mmu::PROT_GPU_SHARED_RW)?;
-        let client = pages
-            .backing
-            .map_alias(client, address, mmu::PROT_GPU_SHARED_RW)?;
+        let (backing, [global, client]) = alloc.lower_with_aliases(
+            TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RW,
+            CpuMap::WriteCombined,
+            [render_global, client],
+        )?;
+        let pages = Pages::from_backing(backing, blocks, RunLayout::Render)?;
         Ok(Self {
             _client: client,
             _global: global,
