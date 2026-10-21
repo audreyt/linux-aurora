@@ -48,7 +48,7 @@ SYM_FUNC_START(apple_context_lab_poweroff)
 SYM_FUNC_END(apple_context_lab_poweroff)
 
 	.pushsection ".idmap.text", "ax"
-/* AURA calls this physical address with MMU off; no return to AURA. */
+/* AURA calls this PA using its normal secondary entry contract; no return. */
 SYM_CODE_START(apple_context_lab_resume)
 	b	cpu_resume
 SYM_CODE_END(apple_context_lab_resume)

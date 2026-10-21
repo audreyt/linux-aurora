@@ -35,6 +35,20 @@ int main(void)
 					check_case(status[a], status[b], elapsed[t], mode);
 					checks++;
 				}
+	for (int phase = LAB_IDLE; phase <= LAB_ABORT; phase++)
+		for (int started = 0; started <= 1; started++) {
+			int allowed = apple_context_lab_may_restore_after_cancel(phase, started);
+
+			if (started || phase == LAB_STOPPING || phase == LAB_RETURNED ||
+			    phase == LAB_ABORT)
+				assert(!allowed);
+			else
+				assert(allowed);
+			checks++;
+		}
+	assert(!apple_context_lab_may_restore_after_cancel(-1, 0));
+	assert(!apple_context_lab_may_restore_after_cancel(99, 0));
+	checks += 2;
 	printf("PASS: %u CPU-start admission cases; no hardware operations\n", checks);
 	return 0;
 }

@@ -17,6 +17,7 @@
 #include <asm/arch_timer.h>
 #include <asm/cacheflush.h>
 #include <asm/cputype.h>
+#include <asm/irqflags.h>
 #include <asm/memory.h>
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
@@ -35,17 +36,10 @@
 #define LAB_CYC sys_reg(3, 5, 15, 5, 0)
 #define LAB_EHID4 sys_reg(3, 0, 15, 4, 1)
 #define LAB_IPI_SR sys_reg(3, 5, 15, 1, 1)
+#define LAB_IPI_PENDING BIT_ULL(0) /* AIC IPI_SR_PENDING: write one to acknowledge. */
 #define LAB_CYC_WAKE_MASK GENMASK_ULL(25, 20)
 #define LAB_CYC_STOP ((2ULL << 20) | (2ULL << 22) | (3ULL << 24) | BIT_ULL(0))
 #define LAB_TIMER_CTL_MASK GENMASK_ULL(1, 0) /* ENABLE and IMASK; ISTATUS is read-only. */
-
-enum lab_phase {
-	LAB_IDLE,
-	LAB_GO,
-	LAB_STOPPING,
-	LAB_RETURNED,
-	LAB_ABORT,
-};
 
 /* Built-in/static: an unrecovered CPU must never outlive this storage. */
 static struct {
@@ -56,7 +50,7 @@ static struct {
 	u64 old_target;
 	u64 resume_pa;
 	u64 cyc_before, cyc_after, ehid4, csselr;
-	u64 ipi_before, ipi_after;
+	u64 ipi_before, ipi_resume_raw, ipi_after;
 	u64 clidr, ccsidr;
 	u64 cntp_ctl, cntp_cval, cntv_ctl, cntv_cval;
 	u64 mpidr_before, mpidr_after;
@@ -64,6 +58,7 @@ static struct {
 	unsigned long parked;
 	int phase;
 	int result;
+	int observer_result;
 	u32 last_status;
 	u32 status_before;
 	bool off_observed;
@@ -166,7 +161,9 @@ static int notrace lab_finisher(unsigned long unused)
 	cyc = (lab.cyc_before & ~LAB_CYC_WAKE_MASK) | LAB_CYC_STOP;
 	write_sysreg_s(cyc, LAB_CYC);
 	isb();
-	lab_set_phase(LAB_STOPPING);
+	/* Cancellation of GO must win before any irreversible CPU stop request. */
+	if (cmpxchg_release(&lab.phase, LAB_GO, LAB_STOPPING) != LAB_GO)
+		return -ECANCELED;
 	/* No C, stack writes or shared-cache maintenance after the final L1 sweep. */
 	apple_context_lab_poweroff(lab.start, BIT(LAB_TARGET));
 }
@@ -177,8 +174,10 @@ static int lab_target(void)
 	u64 ways, sets, bytes;
 	int ret;
 
-	if (!lab_wait_phase(LAB_GO, LAB_READY_US))
-		return -ETIMEDOUT;
+	if (!lab_wait_phase(LAB_GO, LAB_READY_US)) {
+		ret = -ETIMEDOUT;
+		goto abort;
+	}
 	lab.mpidr_before = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
 	lab.cyc_before = read_sysreg_s(LAB_CYC);
 	lab.ehid4 = read_sysreg_s(LAB_EHID4);
@@ -206,7 +205,7 @@ static int lab_target(void)
 	lab.cntp_cval = read_sysreg(cntp_cval_el0);
 	lab.cntv_ctl = read_sysreg(cntv_ctl_el0);
 	lab.cntv_cval = read_sysreg(cntv_cval_el0);
-	if (lab.ipi_before & 1) {
+	if (lab.ipi_before & LAB_IPI_PENDING) {
 		ret = -EBUSY;
 		goto abort;
 	}
@@ -235,12 +234,18 @@ static int lab_target(void)
 		(lab.cntv_ctl & LAB_TIMER_CTL_MASK) &&
 		read_sysreg(cntv_cval_el0) == lab.cntv_cval;
 	lab.cyc_after = read_sysreg_s(LAB_CYC);
+	lab.ipi_resume_raw = read_sysreg_s(LAB_IPI_SR);
+	if (!ret) {
+		/* AURA skips this ack when the resume target was already published. */
+		write_sysreg_s(LAB_IPI_PENDING, LAB_IPI_SR);
+		isb();
+	}
 	lab.ipi_after = read_sysreg_s(LAB_IPI_SR);
 	lab.mpidr_after = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
 	lab.same_task = current == task && smp_processor_id() == LAB_TARGET;
 	if (!ret && (!lab.release_restored || !lab.same_task || !lab.timers_restored ||
 		     lab.mpidr_before != lab.mpidr_after ||
-		     lab.cyc_before != lab.cyc_after || lab.ipi_after & 1))
+		     lab.cyc_before != lab.cyc_after || lab.ipi_after & LAB_IPI_PENDING))
 		ret = -EUCLEAN;
 broadcast_exit:
 	tick_broadcast_exit();
@@ -253,6 +258,7 @@ abort:
 static int lab_observer(void)
 {
 	u64 start = lab_now();
+	int phase, observed;
 
 	/* All callbacks are running with IRQs off before the target may proceed. */
 	while (READ_ONCE(lab.parked) != GENMASK(LAB_CPU_COUNT - 1, 0)) {
@@ -291,10 +297,18 @@ static int lab_observer(void)
 		goto abort;
 	return 0;
 abort:
-	/* Restore the delivery slot, but never issue a second start or stop. */
-	lab_restore_target();
-	WRITE_ONCE(lab.result, -ETIMEDOUT);
-	lab_set_phase(LAB_ABORT);
+	/* Observer errors must not overwrite the target CPU's return value. */
+	WRITE_ONCE(lab.observer_result, -ETIMEDOUT);
+	phase = lab_get_phase();
+	while (phase != LAB_RETURNED && phase != LAB_ABORT) {
+		/* Compete with the finisher's GO -> STOPPING commit, not its result. */
+		observed = cmpxchg_release(&lab.phase, phase, LAB_ABORT);
+		if (observed == phase)
+			break;
+		phase = observed;
+	}
+	if (apple_context_lab_may_restore_after_cancel(phase, lab.start_written))
+		lab_restore_target();
 	return -ETIMEDOUT;
 }
 
@@ -302,6 +316,11 @@ static int lab_stop_cpu(void *unused)
 {
 	unsigned int cpu = smp_processor_id();
 
+	/* AIC timers and IPIs are FIQs: all ten CPUs must have both masks set. */
+	if ((read_sysreg(daif) & (PSR_I_BIT | PSR_F_BIT)) != (PSR_I_BIT | PSR_F_BIT)) {
+		lab_set_phase(LAB_ABORT);
+		return -EINVAL;
+	}
 	set_bit(cpu, &lab.parked);
 	if (cpu == LAB_OBSERVER)
 		return lab_observer();
@@ -358,20 +377,22 @@ unlock:
 static const struct file_operations lab_trigger_fops = {
 	.owner = THIS_MODULE,
 	.write = lab_trigger,
-	.llseek = no_llseek,
+	.open = nonseekable_open,
 };
 
 static int lab_result_show(struct seq_file *s, void *unused)
 {
-	seq_printf(s, "consumed=%d phase=%d result=%d\n", atomic_read(&lab.consumed),
-		   READ_ONCE(lab.phase), READ_ONCE(lab.result));
+	seq_printf(s, "consumed=%d phase=%d result=%d observer_result=%d\n",
+		   atomic_read(&lab.consumed), READ_ONCE(lab.phase),
+		   READ_ONCE(lab.result), READ_ONCE(lab.observer_result));
 	seq_printf(s, "target=1 observer=0 off=%d start=%d status=%#x restored=%d\n",
 		   lab.off_observed, lab.start_written, lab.last_status, lab.release_restored);
 	seq_printf(s, "same_task=%d timers_restored=%d mpidr_before=%#llx mpidr_after=%#llx\n",
 		   lab.same_task, lab.timers_restored, lab.mpidr_before, lab.mpidr_after);
 	seq_printf(s, "cyc_before=%#llx cyc_after=%#llx ehid4=%#llx\n",
 		   lab.cyc_before, lab.cyc_after, lab.ehid4);
-	seq_printf(s, "ipi_before=%#llx ipi_after=%#llx\n", lab.ipi_before, lab.ipi_after);
+	seq_printf(s, "ipi_before=%#llx ipi_resume_raw=%#llx ipi_after=%#llx\n",
+		   lab.ipi_before, lab.ipi_resume_raw, lab.ipi_after);
 	seq_printf(s, "clidr=%#llx ccsidr=%#llx status_before=%#x\n",
 		   lab.clidr, lab.ccsidr, lab.status_before);
 	return 0;

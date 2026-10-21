@@ -30,8 +30,12 @@ There is no RVBAR, ACC_OVRD, DCP, PMP, shared-L2 or DRAM power write.
 AURA's existing per-MPIDR reset path calls the physical trampoline, which enters
 cpu_resume. Only the generic saved-context return counts as a successful
 cpu_suspend. The delivery field, CYC and timer snapshots must be restored before
-the other CPUs are released. The observer also restores the delivery field on
-timeout and never retries a start. An unrecovered CPU prevents stop_machine
+the other CPUs are released. The observer can cancel an uncommitted finisher,
+but leaves the delivery field to CPU1 once a stop is committed and never retries
+a start. Observer errors do not overwrite CPU1's result. Fast-IPI pending state
+is acknowledged after a real saved-context return; a pre-existing pending IPI
+aborts before poweroff and is left for the normal interrupt handler.
+An unrecovered CPU prevents stop_machine
 from completing: that is an expected terminal failure requiring the separately
 reviewed external reset, not a bounded software recovery or successful return.
 
