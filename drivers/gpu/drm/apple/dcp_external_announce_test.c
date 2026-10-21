@@ -108,11 +108,24 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq, announce_test_noop);
+	/* dcp_disable_typec_work() drains these three with
+	 * disable_delayed_work_sync(); the real driver initialises them outside
+	 * this fixture (relink setup and dcp_hdmi_init()), so stub them or the
+	 * sync warns in __flush_work for every test that stops the typec work. */
+	INIT_DELAYED_WORK(&dcp->typec_relink_wq, announce_test_noop);
+	INIT_DELAYED_WORK(&dcp->hdmi_settle_wq, announce_test_noop);
+	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->backlight.fade_work, announce_test_noop);
 	INIT_WORK(&dcp->external_stop_work, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, announce_test_noop);
 	INIT_WORK(&dcp->vblank_wq, announce_test_noop);
+	/* dcp_comp_unbind() calls disable_work_sync(&dcp->dimensions_wq); the
+	 * real driver initialises it in dcp_modes_init() (iomfb.c), which this
+	 * fixture does not run. Leaving it uninitialised makes the sync warn in
+	 * __flush_work and, under KVM timing, derails the unbind so the test's
+	 * pause point is missed and it times out. Stub it like the others. */
+	INIT_WORK(&dcp->dimensions_wq, announce_test_noop);
 	INIT_WORK(&t->con.hotplug_wq, announce_test_event);
 	mutex_init(&t->drm.mode_config.mutex);
 
