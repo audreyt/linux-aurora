@@ -31,6 +31,26 @@ return (6) and completed restore checks (7). cpu_pm_result records the notifier
 return separately. These fields identify admission failures without reporting
 an unexecuted power-off or saved-context return as a hardware failure.
 
+The diagnostic additionally writes short ``^x`` lines directly to the existing
+J314s serial0 console. Its live DT address and Apple UART compatibility must
+match, FIFO and TX must already be configured, and each character polls at most
+8192 times. It never changes UART configuration. MMIO32 and a non-posted device
+mapping match the Apple early console. Capture the UART externally: a reset
+can lose the kernel result and even recently written filesystem receipts.
+Missing markers do not prove a stage was not reached because a full FIFO can
+drop a bounded marker.
+
+``G`` precedes stop_machine; ``O`` is the observer's GO; ``a`` is local-state
+capture; ``b``/``c`` bracket successful CPU-PM entry; ``d`` is the finisher;
+``e`` verifies the published resume address; ``f`` commits the stop; ``l``
+follows the final L1 sweep; ``w`` follows the stop write before WFI; ``F`` is
+observed OFF; ``R``/``S`` bracket the startup writes; ``r`` is the physical
+resume trampoline; ``u`` follows cpu_suspend return; ``C`` completes restoration
+checks; and ``D`` is the observer's completed return wait. The assembly markers
+use scratch registers and MMIO only, preserving the no-stack/no-C contract
+after the final L1 sweep. The physical entry marker itself is experimental
+instrumentation; do not infer a successful cpu_resume from seeing it alone.
+
 The finisher publishes an idmap trampoline through CPU1's existing AURA release
 field. It saves the generic suspend context and local state, programs only the
 local timer/CYC registers, sweeps only local L1, requests one CPU stop and waits

@@ -1,14 +1,38 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
+#include "cpu-context-lab.h"
+
+/* x11 is the UART base; only scratch x12/x13 are changed. Never wait forever. */
+	.macro lab_uart_char value
+	mov	w13, #LAB_UART_POLLS
+.Luart_poll\@:
+	ldr	w12, [x11, #LAB_UART_UFSTAT]
+	tbz	w12, #9, .Luart_write\@
+	subs	w13, w13, #1
+	b.ne	.Luart_poll\@
+	b	.Luart_done\@
+.Luart_write\@:
+	mov	w12, #\value
+	str	w12, [x11, #LAB_UART_UTXH]
+.Luart_done\@:
+	.endm
+
+	.macro lab_uart_mark value
+	lab_uart_char 0x5e /* ^ */
+	lab_uart_char \value
+	lab_uart_char 0x0a
+	dsb	sy
+	.endm
 
 	.text
 /*
- * x0: CPU stop register, x1: target bit. CPU0 holds the shared L2 awake.
+ * x0: CPU stop register, x1: target bit, x2: UART VA. CPU0 holds shared L2 awake.
  * Sweep only the local L1. No stack access or C call follows this sweep.
  * M1 disables set/way L2 operations in EHID4, not L1 operations.
  */
 SYM_FUNC_START(apple_context_lab_poweroff)
+	mov	x11, x2
 	dsb	sy
 	msr	csselr_el1, xzr
 	isb
@@ -39,8 +63,10 @@ SYM_FUNC_START(apple_context_lab_poweroff)
 	subs	x7, x7, #1
 	b.ge	3b
 	dsb	sy
+	lab_uart_mark 0x6c /* l: final L1 sweep completed */
 	str	w1, [x0]
 	dsb	sy
+	lab_uart_mark 0x77 /* w: stop request written, about to enter WFI */
 5:
 	isb
 	wfi
@@ -50,6 +76,8 @@ SYM_FUNC_END(apple_context_lab_poweroff)
 	.pushsection ".idmap.text", "ax"
 /* AURA calls this PA using its normal secondary entry contract; no return. */
 SYM_CODE_START(apple_context_lab_resume)
+	mov_q	x11, LAB_UART_PA
+	lab_uart_mark 0x72 /* r: physical resume trampoline reached */
 	b	cpu_resume
 SYM_CODE_END(apple_context_lab_resume)
 	.popsection

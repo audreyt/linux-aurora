@@ -55,6 +55,7 @@ enum lab_target_step {
 static struct {
 	void __iomem *impl;
 	void __iomem *start;
+	void __iomem *uart;
 	__le64 __iomem *release;
 	u64 release_pa;
 	u64 old_target;
@@ -98,6 +99,54 @@ static u64 lab_now(void)
 static bool lab_expired(u64 start, unsigned int us)
 {
 	return lab_now() - start >= div_u64(lab.counter_hz * us, 1000000);
+}
+
+static void notrace lab_uart_char(u8 value)
+{
+	unsigned int left = LAB_UART_POLLS;
+
+	while (readl_relaxed(lab.uart + LAB_UART_UFSTAT) & LAB_UART_TX_FULL) {
+		if (!--left)
+			return;
+		cpu_relax();
+	}
+	writel_relaxed(value, lab.uart + LAB_UART_UTXH);
+}
+
+static void notrace lab_uart_mark(u8 value)
+{
+	/* All CPUs are parked during transition markers; no console lock is used. */
+	lab_uart_char('^');
+	lab_uart_char(value);
+	lab_uart_char('\n');
+	dsb(sy);
+}
+
+static void lab_uart_unmap(void *mapping)
+{
+	iounmap(mapping);
+}
+
+static int __init lab_uart_probe(struct platform_device *pdev)
+{
+	struct device_node *np = of_find_node_by_path("serial0");
+	struct resource resource;
+	int ret;
+
+	if (!np)
+		return -ENODEV;
+	ret = of_device_is_available(np) && of_device_is_compatible(np, "apple,s5l-uart") ?
+		of_address_to_resource(np, 0, &resource) : -ENODEV;
+	of_node_put(np);
+	if (ret)
+		return ret;
+	if (resource.start != LAB_UART_PA || resource_size(&resource) < LAB_UART_SIZE)
+		return -ESTALE;
+	/* Match the Apple early console's MMIO32, non-posted device mapping. */
+	lab.uart = ioremap_np(resource.start, LAB_UART_SIZE);
+	if (!lab.uart)
+		return -ENOMEM;
+	return devm_add_action_or_reset(&pdev->dev, lab_uart_unmap, lab.uart);
 }
 
 static int lab_get_phase(void)
@@ -157,6 +206,7 @@ static int notrace lab_finisher(unsigned long unused)
 	u64 cyc;
 
 	WRITE_ONCE(lab.target_step, LAB_STEP_FINISHER);
+	lab_uart_mark('d');
 	/* The current Linux resume implementation consumes a virtual state pointer. */
 	if (!state)
 		return -EINVAL;
@@ -167,6 +217,7 @@ static int notrace lab_finisher(unsigned long unused)
 		lab_restore_target();
 		return -EIO;
 	}
+	lab_uart_mark('e');
 
 	/* Broadcast handles the clockevent; preserve both architectural timers. */
 	write_sysreg(0, cntp_ctl_el0);
@@ -178,8 +229,9 @@ static int notrace lab_finisher(unsigned long unused)
 	if (cmpxchg_release(&lab.phase, LAB_GO, LAB_STOPPING) != LAB_GO)
 		return -ECANCELED;
 	WRITE_ONCE(lab.target_step, LAB_STEP_STOP_COMMITTED);
+	lab_uart_mark('f');
 	/* No C, stack writes or shared-cache maintenance after the final L1 sweep. */
-	apple_context_lab_poweroff(lab.start, BIT(LAB_TARGET));
+	apple_context_lab_poweroff(lab.start, BIT(LAB_TARGET), lab.uart);
 }
 
 static int lab_target(void)
@@ -220,6 +272,7 @@ static int lab_target(void)
 	lab.cntv_ctl = read_sysreg(cntv_ctl_el0);
 	lab.cntv_cval = read_sysreg(cntv_cval_el0);
 	WRITE_ONCE(lab.target_step, LAB_STEP_LOCAL_READY);
+	lab_uart_mark('a');
 	if (lab.ipi_before & LAB_IPI_PENDING) {
 		ret = -EBUSY;
 		goto abort;
@@ -233,14 +286,17 @@ static int lab_target(void)
 	 * instead; expired events are handled after stop_machine releases CPUs.
 	 */
 	WRITE_ONCE(lab.target_step, LAB_STEP_CPU_PM_ENTER);
+	lab_uart_mark('b');
 	ret = cpu_pm_enter();
 	WRITE_ONCE(lab.cpu_pm_result, ret);
 	if (ret)
 		goto abort; /* Robust enter already sent ENTER_FAILED. */
 	WRITE_ONCE(lab.target_step, LAB_STEP_CPU_PM_READY);
+	lab_uart_mark('c');
 
 	ret = cpu_suspend(0, lab_finisher);
 	WRITE_ONCE(lab.target_step, LAB_STEP_RESUMED);
+	lab_uart_mark('u');
 	lab_restore_target();
 	write_sysreg_s(lab.cyc_before, LAB_CYC);
 	write_sysreg(lab.csselr, csselr_el1);
@@ -271,6 +327,7 @@ static int lab_target(void)
 		     lab.cyc_before != lab.cyc_after || lab.ipi_after & LAB_IPI_PENDING))
 		ret = -EUCLEAN;
 	WRITE_ONCE(lab.target_step, LAB_STEP_COMPLETE);
+	lab_uart_mark('C');
 abort:
 	WRITE_ONCE(lab.result, ret);
 	lab_set_phase(ret ? LAB_ABORT : LAB_RETURNED);
@@ -292,6 +349,7 @@ static int lab_observer(void)
 	lab.status_before = readl_relaxed(lab.impl + LAB_STATUS);
 	if (!(lab.status_before & 0xff))
 		goto abort;
+	lab_uart_mark('O');
 	lab_set_phase(LAB_GO);
 	if (!lab_wait_phase(LAB_STOPPING, LAB_READY_US))
 		goto abort;
@@ -310,13 +368,17 @@ static int lab_observer(void)
 					 div_u64((lab_now() - start) * 1000000, lab.counter_hz)))
 		goto abort;
 	lab.off_observed = true;
+	lab_uart_mark('F');
 	dsb(sy);
 	/* AURA cpu_start_bit(): BIT(4 * cluster + core); target is cluster0/core1. */
+	lab_uart_mark('R');
 	writel(BIT(1), lab.start + 4);
 	writel(BIT(1), lab.start + 8);
 	lab.start_written = true;
+	lab_uart_mark('S');
 	if (!lab_wait_phase(LAB_RETURNED, LAB_RETURN_US))
 		goto abort;
+	lab_uart_mark('D');
 	return 0;
 abort:
 	/* Observer errors must not overwrite the target CPU's return value. */
@@ -356,6 +418,9 @@ static int lab_stop_cpu(void *unused)
 
 static int lab_preflight(void)
 {
+	if (!(readl_relaxed(lab.uart + LAB_UART_UFCON) & LAB_UART_FIFO_ENABLED) ||
+	    !(readl_relaxed(lab.uart + LAB_UART_UCON) & 0xc))
+		return -ENODEV;
 	if (num_online_cpus() != LAB_CPU_COUNT ||
 	    cpumask_last(cpu_online_mask) != LAB_CPU_COUNT - 1 ||
 	    cpu_logical_map(LAB_OBSERVER) != 0 || cpu_logical_map(LAB_TARGET) != 1 ||
@@ -385,6 +450,7 @@ static ssize_t lab_trigger(struct file *file, const char __user *buf,
 	ret = lab_preflight();
 	if (!ret) {
 		pr_notice("apple-context-lab: CPU1 context-loss attempt consumed\n");
+		lab_uart_mark('G');
 		ret = stop_machine_cpuslocked(lab_stop_cpu, NULL, cpu_online_mask);
 		pr_notice("apple-context-lab: return=%d phase=%d off=%d start=%d restored=%d\n",
 			  ret, lab.phase, lab.off_observed, lab.start_written,
@@ -451,6 +517,9 @@ static int __init lab_probe(struct platform_device *pdev)
 	lab.start = devm_platform_ioremap_resource_byname(pdev, "cpu-start");
 	if (IS_ERR(lab.start))
 		return PTR_ERR(lab.start);
+	ret = lab_uart_probe(pdev);
+	if (ret)
+		return ret;
 	lab.release = ioremap_cache(lab.release_pa, sizeof(*lab.release));
 	if (!lab.release)
 		return -ENOMEM;
