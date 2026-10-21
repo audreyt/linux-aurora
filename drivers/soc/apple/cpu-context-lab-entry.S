@@ -67,10 +67,21 @@ SYM_FUNC_START(apple_context_lab_poweroff)
 	str	w1, [x0]
 	dsb	sy
 	lab_uart_mark 0x77 /* w: stop request written, about to enter WFI */
-5:
 	isb
 	wfi
-	b	5b
+	/* Report only the first WFI return; never acknowledge or clear its cause. */
+	mrs	x14, isr_el1
+	mrs	x15, S3_5_C15_C1_1
+	lab_uart_mark 0x71 /* q: WFI returned without entering the resume vector */
+	cbz	x14, 5f
+	lab_uart_mark 0x69 /* i: ISR_EL1 was nonzero at first return */
+5:
+	tbz	x15, #0, 6f
+	lab_uart_mark 0x6a /* j: fast IPI pending at first return */
+6:
+	isb
+	wfi
+	b	6b
 SYM_FUNC_END(apple_context_lab_poweroff)
 
 	.pushsection ".idmap.text", "ax"

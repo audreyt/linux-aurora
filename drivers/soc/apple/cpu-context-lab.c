@@ -234,12 +234,17 @@ static int notrace lab_finisher(unsigned long unused)
 	}
 	lab_uart_mark('e');
 
-	/* Broadcast handles the clockevent; preserve both architectural timers. */
+	/* Preserve the stopped-machine test's two architectural timer snapshots. */
 	write_sysreg(0, cntp_ctl_el0);
 	write_sysreg(0, cntv_ctl_el0);
 	cyc = (lab.cyc_before & ~LAB_CYC_WAKE_MASK) | LAB_CYC_STOP;
 	write_sysreg_s(cyc, LAB_CYC);
 	isb();
+	/* Serialized before STOPPING: CPU0 cannot interleave its status trace. */
+	lab_uart_value('K', lab.cyc_before);
+	lab_uart_value('Y', read_sysreg_s(LAB_CYC));
+	lab_uart_value('I', read_sysreg(isr_el1));
+	lab_uart_value('J', read_sysreg_s(LAB_IPI_SR));
 	/* Cancellation of GO must win before any irreversible CPU stop request. */
 	if (cmpxchg_release(&lab.phase, LAB_GO, LAB_STOPPING) != LAB_GO)
 		return -ECANCELED;
