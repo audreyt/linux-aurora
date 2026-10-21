@@ -25,6 +25,35 @@
 	dsb	sy
 	.endm
 
+/* x14 holds the read-only snapshot; x9/x10/x12/x13/x16 are scratch. */
+	.macro lab_uart_hex tag
+	lab_uart_char 0x5e
+	lab_uart_char \tag
+	lab_uart_char 0x3d
+	mov	w16, #60
+.Lhex_digit\@:
+	lsrv	x9, x14, x16
+	and	w9, w9, #0xf
+	cmp	w9, #10
+	add	w9, w9, #0x30
+	add	w10, w9, #0x27
+	csel	w9, w9, w10, lo
+	mov	w13, #LAB_UART_POLLS
+.Lhex_poll\@:
+	ldr	w12, [x11, #LAB_UART_UFSTAT]
+	tbz	w12, #9, .Lhex_write\@
+	subs	w13, w13, #1
+	b.ne	.Lhex_poll\@
+	b	.Lhex_next\@
+.Lhex_write\@:
+	str	w9, [x11, #LAB_UART_UTXH]
+.Lhex_next\@:
+	subs	w16, w16, #4
+	b.ge	.Lhex_digit\@
+	lab_uart_char 0x0a
+	dsb	sy
+	.endm
+
 	.text
 /*
  * x0: CPU stop register, x1: target bit, x2: UART VA. CPU0 holds shared L2 awake.
@@ -73,11 +102,29 @@ SYM_FUNC_START(apple_context_lab_poweroff)
 	mrs	x14, isr_el1
 	mrs	x15, S3_5_C15_C1_1
 	lab_uart_mark 0x71 /* q: WFI returned without entering the resume vector */
-	cbz	x14, 5f
-	lab_uart_mark 0x69 /* i: ISR_EL1 was nonzero at first return */
-5:
-	tbz	x15, #0, 6f
-	lab_uart_mark 0x6a /* j: fast IPI pending at first return */
+	lab_uart_hex 0x48 /* H: ISR_EL1 captured at first return */
+	mov	x14, x15
+	lab_uart_hex 0x51 /* Q: fast IPI status captured at first return */
+	mrs	x14, cntp_ctl_el0
+	lab_uart_hex 0x4e /* N: host physical timer control */
+	mrs	x14, cntv_ctl_el0
+	lab_uart_hex 0x5a /* Z: host virtual timer control */
+	mrs	x14, S3_1_C15_C0_0
+	lab_uart_hex 0x4d /* M: PMCR0, as read by the AIC FIQ handler */
+	mrs	x14, S3_7_C15_C0_4
+	lab_uart_hex 0x55 /* U: uncore PMC interrupt mode */
+	mrs	x14, S3_7_C15_C6_4
+	lab_uart_hex 0x57 /* W: uncore PMC interrupt status */
+	mrs	x14, CurrentEL
+	lab_uart_hex 0x4c /* L: gate EL2-only timer reads below */
+	cmp	x14, #8
+	b.ne	6f
+	mrs	x14, S3_5_C14_C2_1
+	lab_uart_hex 0x70 /* p: guest physical timer control, EL02 */
+	mrs	x14, S3_5_C14_C3_1
+	lab_uart_hex 0x76 /* v: guest virtual timer control, EL02 */
+	mrs	x14, S3_5_C15_C1_3
+	lab_uart_hex 0x68 /* h: guest timer FIQ enable, EL2 */
 6:
 	isb
 	wfi

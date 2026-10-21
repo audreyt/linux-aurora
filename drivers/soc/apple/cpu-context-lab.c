@@ -378,12 +378,10 @@ static int lab_observer(void)
 		goto abort;
 
 	start = lab_now();
-	lab_uart_mark('P');
 	for (;;) {
 		/* CPU_IMPL registers use the firmware's 64-bit access width. */
 		lab.last_status = readq_relaxed(lab.impl + LAB_STATUS);
-		if (!polls)
-			lab_uart_value('T', lab.last_status);
+		/* Leave UART to CPU1 until OFF or timeout, preserving its snapshots. */
 		if (!(lab.last_status & 0xff))
 			break;
 		if (++polls >= LAB_STATUS_POLLS || lab_expired(start, LAB_OFF_US)) {
