@@ -51,6 +51,16 @@ use scratch registers and MMIO only, preserving the no-stack/no-C contract
 after the final L1 sweep. The physical entry marker itself is experimental
 instrumentation; do not infer a successful cpu_resume from seeing it alone.
 
+CPU_IMPL status accesses use the same 64-bit width as AURA's smp_stop_cpu.
+Observer markers ``B``/``V=<hex>`` bracket the initial status read, and
+``P``/``T=<hex>`` bracket the first read after stop commitment. An OFF timeout
+prints the final value as ``X=<hex>`` and elapsed counter ticks as ``E=<hex>``,
+then ``A`` at observer abort. The status loop also has a finite poll count if
+its counter stops advancing. A hardware MMIO transaction can itself stall;
+the external controller remains the actual recovery bound. Concurrent markers
+from the two cores can interleave, so retain the raw stream as well as parsed
+labels and never treat a missing or malformed label as proof of absence.
+
 The finisher publishes an idmap trampoline through CPU1's existing AURA release
 field. It saves the generic suspend context and local state, programs only the
 local timer/CYC registers, sweeps only local L1, requests one CPU stop and waits

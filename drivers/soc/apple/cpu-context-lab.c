@@ -32,6 +32,7 @@
 #define LAB_OFF_US 50000
 #define LAB_RETURN_US 500000
 #define LAB_READY_US 50000
+#define LAB_STATUS_POLLS 500000
 #define LAB_CYC sys_reg(3, 5, 15, 5, 0)
 #define LAB_EHID4 sys_reg(3, 0, 15, 4, 1)
 #define LAB_IPI_SR sys_reg(3, 5, 15, 1, 1)
@@ -72,8 +73,8 @@ static struct {
 	int observer_result;
 	int cpu_pm_result;
 	enum lab_target_step target_step;
-	u32 last_status;
-	u32 status_before;
+	u64 last_status;
+	u64 status_before;
 	bool off_observed;
 	bool start_written;
 	bool release_restored;
@@ -118,6 +119,20 @@ static void notrace lab_uart_mark(u8 value)
 	/* All CPUs are parked during transition markers; no console lock is used. */
 	lab_uart_char('^');
 	lab_uart_char(value);
+	lab_uart_char('\n');
+	dsb(sy);
+}
+
+static void notrace lab_uart_value(u8 tag, u64 value)
+{
+	static const char digits[] = "0123456789abcdef";
+	int shift;
+
+	lab_uart_char('^');
+	lab_uart_char(tag);
+	lab_uart_char('=');
+	for (shift = 60; shift >= 0; shift -= 4)
+		lab_uart_char(digits[(value >> shift) & 0xf]);
 	lab_uart_char('\n');
 	dsb(sy);
 }
@@ -337,6 +352,7 @@ abort:
 static int lab_observer(void)
 {
 	u64 start = lab_now();
+	unsigned int polls = 0;
 	int phase, observed;
 
 	/* All callbacks are running with IRQs off before the target may proceed. */
@@ -346,7 +362,9 @@ static int lab_observer(void)
 		cpu_relax();
 	}
 	/* A zero before the target even enters its finisher is not an OFF transition. */
-	lab.status_before = readl_relaxed(lab.impl + LAB_STATUS);
+	lab_uart_mark('B');
+	lab.status_before = readq_relaxed(lab.impl + LAB_STATUS);
+	lab_uart_value('V', lab.status_before);
 	if (!(lab.status_before & 0xff))
 		goto abort;
 	lab_uart_mark('O');
@@ -355,12 +373,19 @@ static int lab_observer(void)
 		goto abort;
 
 	start = lab_now();
+	lab_uart_mark('P');
 	for (;;) {
-		lab.last_status = readl_relaxed(lab.impl + LAB_STATUS);
+		/* CPU_IMPL registers use the firmware's 64-bit access width. */
+		lab.last_status = readq_relaxed(lab.impl + LAB_STATUS);
+		if (!polls)
+			lab_uart_value('T', lab.last_status);
 		if (!(lab.last_status & 0xff))
 			break;
-		if (lab_expired(start, LAB_OFF_US))
+		if (++polls >= LAB_STATUS_POLLS || lab_expired(start, LAB_OFF_US)) {
+			lab_uart_value('X', lab.last_status);
+			lab_uart_value('E', lab_now() - start);
 			goto abort;
+		}
 		cpu_relax();
 	}
 	if (!apple_context_lab_may_start(lab.status_before, lab.last_status,
@@ -381,6 +406,7 @@ static int lab_observer(void)
 	lab_uart_mark('D');
 	return 0;
 abort:
+	lab_uart_mark('A');
 	/* Observer errors must not overwrite the target CPU's return value. */
 	WRITE_ONCE(lab.observer_result, -ETIMEDOUT);
 	phase = lab_get_phase();
@@ -473,7 +499,7 @@ static int lab_result_show(struct seq_file *s, void *unused)
 	seq_printf(s, "consumed=%d phase=%d result=%d observer_result=%d\n",
 		   atomic_read(&lab.consumed), READ_ONCE(lab.phase),
 		   READ_ONCE(lab.result), READ_ONCE(lab.observer_result));
-	seq_printf(s, "target=1 observer=0 off=%d start=%d status=%#x restored=%d\n",
+	seq_printf(s, "target=1 observer=0 off=%d start=%d status=%#llx restored=%d\n",
 		   lab.off_observed, lab.start_written, lab.last_status, lab.release_restored);
 	seq_printf(s, "same_task=%d timers_restored=%d mpidr_before=%#llx mpidr_after=%#llx\n",
 		   lab.same_task, lab.timers_restored, lab.mpidr_before, lab.mpidr_after);
@@ -481,7 +507,7 @@ static int lab_result_show(struct seq_file *s, void *unused)
 		   lab.cyc_before, lab.cyc_after, lab.ehid4);
 	seq_printf(s, "ipi_before=%#llx ipi_resume_raw=%#llx ipi_after=%#llx\n",
 		   lab.ipi_before, lab.ipi_resume_raw, lab.ipi_after);
-	seq_printf(s, "clidr=%#llx ccsidr=%#llx status_before=%#x\n",
+	seq_printf(s, "clidr=%#llx ccsidr=%#llx status_before=%#llx\n",
 		   lab.clidr, lab.ccsidr, lab.status_before);
 	seq_printf(s, "target_step=%d cpu_pm_result=%d\n",
 		   READ_ONCE(lab.target_step), READ_ONCE(lab.cpu_pm_result));
