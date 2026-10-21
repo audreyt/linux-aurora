@@ -12,7 +12,6 @@
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/stop_machine.h>
-#include <linux/tick.h>
 #include <linux/uaccess.h>
 #include <asm/arch_timer.h>
 #include <asm/cacheflush.h>
@@ -41,6 +40,17 @@
 #define LAB_CYC_STOP ((2ULL << 20) | (2ULL << 22) | (3ULL << 24) | BIT_ULL(0))
 #define LAB_TIMER_CTL_MASK GENMASK_ULL(1, 0) /* ENABLE and IMASK; ISTATUS is read-only. */
 
+enum lab_target_step {
+	LAB_STEP_NONE,
+	LAB_STEP_LOCAL_READY,
+	LAB_STEP_CPU_PM_ENTER,
+	LAB_STEP_CPU_PM_READY,
+	LAB_STEP_FINISHER,
+	LAB_STEP_STOP_COMMITTED,
+	LAB_STEP_RESUMED,
+	LAB_STEP_COMPLETE,
+};
+
 /* Built-in/static: an unrecovered CPU must never outlive this storage. */
 static struct {
 	void __iomem *impl;
@@ -59,6 +69,8 @@ static struct {
 	int phase;
 	int result;
 	int observer_result;
+	int cpu_pm_result;
+	enum lab_target_step target_step;
 	u32 last_status;
 	u32 status_before;
 	bool off_observed;
@@ -144,6 +156,7 @@ static int notrace lab_finisher(unsigned long unused)
 	unsigned long state = READ_ONCE(*(unsigned long *)slot);
 	u64 cyc;
 
+	WRITE_ONCE(lab.target_step, LAB_STEP_FINISHER);
 	/* The current Linux resume implementation consumes a virtual state pointer. */
 	if (!state)
 		return -EINVAL;
@@ -164,6 +177,7 @@ static int notrace lab_finisher(unsigned long unused)
 	/* Cancellation of GO must win before any irreversible CPU stop request. */
 	if (cmpxchg_release(&lab.phase, LAB_GO, LAB_STOPPING) != LAB_GO)
 		return -ECANCELED;
+	WRITE_ONCE(lab.target_step, LAB_STEP_STOP_COMMITTED);
 	/* No C, stack writes or shared-cache maintenance after the final L1 sweep. */
 	apple_context_lab_poweroff(lab.start, BIT(LAB_TARGET));
 }
@@ -205,19 +219,28 @@ static int lab_target(void)
 	lab.cntp_cval = read_sysreg(cntp_cval_el0);
 	lab.cntv_ctl = read_sysreg(cntv_ctl_el0);
 	lab.cntv_cval = read_sysreg(cntv_cval_el0);
+	WRITE_ONCE(lab.target_step, LAB_STEP_LOCAL_READY);
 	if (lab.ipi_before & LAB_IPI_PENDING) {
 		ret = -EBUSY;
 		goto abort;
 	}
 
-	ret = tick_broadcast_enter();
-	if (ret)
-		goto abort;
+	/*
+	 * This is a stopped-machine context test, not schedulable idle. All CPUs
+	 * already mask IRQ/FIQ; CPU0 stays active and explicitly restarts CPU1.
+	 * A CPU-local broadcast hrtimer cannot deliver deadlines in this window
+	 * and may veto its own owner. Preserve/restore the local timer registers
+	 * instead; expired events are handled after stop_machine releases CPUs.
+	 */
+	WRITE_ONCE(lab.target_step, LAB_STEP_CPU_PM_ENTER);
 	ret = cpu_pm_enter();
+	WRITE_ONCE(lab.cpu_pm_result, ret);
 	if (ret)
-		goto broadcast_exit; /* Robust enter already sent ENTER_FAILED. */
+		goto abort; /* Robust enter already sent ENTER_FAILED. */
+	WRITE_ONCE(lab.target_step, LAB_STEP_CPU_PM_READY);
 
 	ret = cpu_suspend(0, lab_finisher);
+	WRITE_ONCE(lab.target_step, LAB_STEP_RESUMED);
 	lab_restore_target();
 	write_sysreg_s(lab.cyc_before, LAB_CYC);
 	write_sysreg(lab.csselr, csselr_el1);
@@ -247,8 +270,7 @@ static int lab_target(void)
 		     lab.mpidr_before != lab.mpidr_after ||
 		     lab.cyc_before != lab.cyc_after || lab.ipi_after & LAB_IPI_PENDING))
 		ret = -EUCLEAN;
-broadcast_exit:
-	tick_broadcast_exit();
+	WRITE_ONCE(lab.target_step, LAB_STEP_COMPLETE);
 abort:
 	WRITE_ONCE(lab.result, ret);
 	lab_set_phase(ret ? LAB_ABORT : LAB_RETURNED);
@@ -395,6 +417,8 @@ static int lab_result_show(struct seq_file *s, void *unused)
 		   lab.ipi_before, lab.ipi_resume_raw, lab.ipi_after);
 	seq_printf(s, "clidr=%#llx ccsidr=%#llx status_before=%#x\n",
 		   lab.clidr, lab.ccsidr, lab.status_before);
+	seq_printf(s, "target_step=%d cpu_pm_result=%d\n",
+		   READ_ONCE(lab.target_step), READ_ONCE(lab.cpu_pm_result));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(lab_result);

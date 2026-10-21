@@ -16,9 +16,20 @@ device tree, boot identity, no active VMs, serial identity and reset recovery.
 
 All ten online CPUs enter stop_machine callbacks with interrupts disabled.
 CPU0 remains active in CPU1's E cluster; the other eight CPUs cannot initiate
-waited IPIs or TLB shootdowns. CPU1 enters the timer broadcast and CPU-PM notifier
-paths, then generic cpu_suspend. A CPU-PM veto has already been unwound by
+waited IPIs or TLB shootdowns. CPU1 enters the CPU-PM notifier path, then generic
+cpu_suspend. This stopped-machine test preserves the local timer registers
+instead of entering timer broadcast: no CPU can service broadcast events while
+all callbacks mask IRQ/FIQ, and CPU0 explicitly restarts CPU1. CPU-local hrtimer
+broadcast can otherwise veto its own owner before the test reaches poweroff.
+Expired local events are handled after the callbacks release the CPUs.
+A CPU-PM veto has already been unwound by
 CPU_PM_ENTER_FAILED and does not receive an unmatched CPU_PM_EXIT.
+
+The result's target_step distinguishes local-state capture (1), CPU-PM entry
+(2), CPU-PM admission (3), finisher entry (4), committed stop (5), cpu_suspend
+return (6) and completed restore checks (7). cpu_pm_result records the notifier
+return separately. These fields identify admission failures without reporting
+an unexecuted power-off or saved-context return as a hardware failure.
 
 The finisher publishes an idmap trampoline through CPU1's existing AURA release
 field. It saves the generic suspend context and local state, programs only the
