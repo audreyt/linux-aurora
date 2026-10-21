@@ -20,8 +20,9 @@ builder installs from) is what the nightly rebuild is for.
 
 This script computes the key, pins the omarchy-pkgs commit it was computed
 from, and looks those artifacts up through the Actions API. It accepts only
-artifacts that this repository's kernel CI uploaded from its own branches,
-never one from a fork's pull request (see TRUSTED_WORKFLOWS).
+artifacts this repository's kernel CI uploaded (see TRUSTED_WORKFLOWS);
+a reused package or verification record must also come from a non-pull-request
+run (REUSE_EVENTS), while a comparison baseline may come from a pull request.
 """
 
 import argparse
@@ -84,7 +85,14 @@ def build_key(kernel_tree, recipe_trees):
 # from runs of this repository's kernel CI on this repository's own branches
 # and events. Pushing a branch here needs write access; a fork does not.
 TRUSTED_WORKFLOWS = {".github/workflows/kernel-ci.yml", ".github/workflows/kernel-ci-label.yml"}
-TRUSTED_EVENTS = {"push", "merge_group", "schedule", "workflow_dispatch", "pull_request"}
+# A package or a verification record is substituted into a later run instead
+# of rebuilding/retesting, so it may only be reused from a run that is not a
+# pull request: a writer's CI-only pull request has the same build key as the
+# branch tip and could otherwise plant a package before anyone reviews it.
+REUSE_EVENTS = {"push", "merge_group", "schedule", "workflow_dispatch"}
+# A comparison baseline is only read, never substituted, so a pull request's
+# metadata is fine as a baseline.
+BASELINE_EVENTS = REUSE_EVENTS | {"pull_request"}
 
 
 class Api:
@@ -105,19 +113,18 @@ class Api:
         with urllib.request.urlopen(request, timeout=60) as response:
             return json.load(response)
 
-    def trusted_run(self, run_id):
-        """Whether a run is this repository's kernel CI on one of its own
-        branches (or the queue, a schedule or a manual run), not a fork's."""
+    def trusted_run(self, run_id, events):
+        """Whether a run is this repository's kernel CI, from one of the given
+        events, on this repository (not a fork)."""
         if run_id not in self._runs:
-            run = self.get(f"actions/runs/{run_id}")
-            self._runs[run_id] = (
-                run.get("event") in TRUSTED_EVENTS
+            self._runs[run_id] = self.get(f"actions/runs/{run_id}")
+        run = self._runs[run_id]
+        return (run.get("event") in events
                 and run.get("path") in TRUSTED_WORKFLOWS
                 and (run.get("repository") or {}).get("id") == self.repository_id
                 and (run.get("head_repository") or {}).get("id") == self.repository_id)
-        return self._runs[run_id]
 
-    def newest_artifact(self, name):
+    def newest_artifact(self, name, events):
         """Run ID of the newest unexpired artifact with this exact name that a
         trusted run uploaded, or ''."""
         data = self.get("actions/artifacts", name=name, per_page=100)
@@ -127,7 +134,7 @@ class Api:
                 and a.get("workflow_run", {}).get("head_repository_id") == self.repository_id]
         live.sort(key=lambda a: a.get("created_at", ""), reverse=True)
         for artifact in live:
-            if self.trusted_run(artifact["workflow_run"]["id"]):
+            if self.trusted_run(artifact["workflow_run"]["id"], events):
                 return str(artifact["workflow_run"]["id"])
         return ""
 
@@ -140,12 +147,12 @@ def lookup(api, kernel, recipe_repo, base_sha, force):
     out = {"key": key, "kernel_tree": kernel_tree, "recipe_commit": recipe_commit,
            "package_run": "", "verified_run": "", "base_tree": "", "baseline_run": ""}
     if not force:
-        out["package_run"] = api.newest_artifact(f"kernel-package-{key}")
-        out["verified_run"] = api.newest_artifact(f"kernel-verified-{key}")
+        out["package_run"] = api.newest_artifact(f"kernel-package-{key}", REUSE_EVENTS)
+        out["verified_run"] = api.newest_artifact(f"kernel-verified-{key}", REUSE_EVENTS)
     if base_sha:
         ensure_commit(kernel, base_sha)
         out["base_tree"] = kernel_id(kernel, base_sha)
-        out["baseline_run"] = api.newest_artifact(f"kernel-metadata-{out['base_tree']}")
+        out["baseline_run"] = api.newest_artifact(f"kernel-metadata-{out['base_tree']}", BASELINE_EVENTS)
     return out
 
 

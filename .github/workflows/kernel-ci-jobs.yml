@@ -320,6 +320,14 @@ jobs:
           path: out
           run-id: ${{ env.REUSE_RUN }}
           github-token: ${{ github.token }}
+      # inspect-package.py resolves module symbols with depmod and unpacks
+      # with tar --zstd; the Namespace builder image ships neither.
+      - name: Ensure kmod and zstd for the package checks
+        run: |
+          if ! command -v depmod >/dev/null || ! command -v zstd >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends kmod zstd
+          fi
       - name: Inspect the packages
         run: |
           python3 -I linux/tools/aurora-ci/inspect-package.py --packages out/packages \

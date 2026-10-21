@@ -8,8 +8,8 @@ class FakeApi:
     def __init__(self, artifacts=None):
         self.artifacts, self.asked = artifacts or {}, []
 
-    def newest_artifact(self, name):
-        self.asked.append(name)
+    def newest_artifact(self, name, events):
+        self.asked.append((name, frozenset(events)))
         return self.artifacts.get(name, "")
 
 
@@ -101,18 +101,16 @@ class ApiTest(TempDirTestCase):
         api = self.api([artifact(1, "2026-10-20", expired=True), artifact(2, "2026-10-18"),
                         artifact(3, "2026-10-19"), artifact(4, "2026-10-21", name="other")],
                        {2: run(), 3: run("merge_group")})
-        self.assertEqual(api.newest_artifact("kernel-package-x"), "3")
-        self.assertEqual(self.api([], {}).newest_artifact("kernel-package-x"), "")
+        self.assertEqual(api.newest_artifact("kernel-package-x", lookup.REUSE_EVENTS), "3")
+        self.assertEqual(self.api([], {}).newest_artifact("kernel-package-x", lookup.REUSE_EVENTS), "")
 
     def test_a_fork_run_is_never_reused(self):
-        # A fork's pull request uploads a newer artifact under the same name.
         api = self.api([artifact(2, "2026-10-18"), artifact(9, "2026-10-20", head_repo=2000)],
                        {2: run(), 9: run("pull_request", head_repo=2000)})
-        self.assertEqual(api.newest_artifact("kernel-package-x"), "2")
+        self.assertEqual(api.newest_artifact("kernel-package-x", lookup.BASELINE_EVENTS), "2")
         self.assertNotIn("actions/runs/9", api.calls)
 
     def test_the_run_itself_must_be_trusted(self):
-        # The artifact claims this repository, but the run says otherwise.
         cases = {
             "fork head": run("pull_request", head_repo=2000),
             "another workflow": run(path=".github/workflows/something-else.yml"),
@@ -121,12 +119,21 @@ class ApiTest(TempDirTestCase):
         for name, untrusted in cases.items():
             with self.subTest(name):
                 api = self.api([artifact(5, "2026-10-20")], {5: untrusted})
-                self.assertEqual(api.newest_artifact("kernel-package-x"), "")
+                self.assertEqual(api.newest_artifact("kernel-package-x", lookup.BASELINE_EVENTS), "")
 
-    def test_branches_of_this_repository_and_every_trusted_event(self):
-        for event in sorted(lookup.TRUSTED_EVENTS):
+    def test_package_and_verified_reuse_excludes_pull_requests(self):
+        # A writer's CI-only PR run uploads a package under the branch tip's key.
+        api = self.api([artifact(7, "2026-10-20")], {7: run("pull_request")})
+        self.assertEqual(api.newest_artifact("kernel-package-x", lookup.REUSE_EVENTS), "",
+                         "a pull-request run must not be reused as a package")
+        # The same PR run, as a comparison baseline, is acceptable.
+        api = self.api([artifact(7, "2026-10-20", name="kernel-metadata-x")], {7: run("pull_request")})
+        self.assertEqual(api.newest_artifact("kernel-metadata-x", lookup.BASELINE_EVENTS), "7")
+
+    def test_reuse_events_cover_the_non_pr_triggers(self):
+        for event in sorted(lookup.REUSE_EVENTS):
             with self.subTest(event):
                 api = self.api([artifact(5, "2026-10-20")], {5: run(event)})
-                self.assertEqual(api.newest_artifact("kernel-package-x"), "5")
-        api = self.api([artifact(6, "2026-10-20")], {6: run("pull_request", ".github/workflows/kernel-ci-label.yml")})
-        self.assertEqual(api.newest_artifact("kernel-package-x"), "6")
+                self.assertEqual(api.newest_artifact("kernel-package-x", lookup.REUSE_EVENTS), "5")
+        self.assertNotIn("pull_request", lookup.REUSE_EVENTS)
+        self.assertIn("pull_request", lookup.BASELINE_EVENTS)
