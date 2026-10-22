@@ -209,6 +209,14 @@ impl RenderState {
             .ok_or(EIO)
     }
 
+    /// Whether the pair in `slot` is out of its entry, borrowed by an event
+    /// pass, a preparation or a growth that returns it under the device mutex.
+    fn borrowed(&self, slot: u8) -> bool {
+        self.entry(slot).is_ok_and(|entry| {
+            entry.pair.is_none() && (entry.preparing.is_some() || entry.growing)
+        })
+    }
+
     /// Whether a completion event arrived while the pair in `slot` was
     /// borrowed; clears the record. The returned pair is installed again, so
     /// the next event pass observes it.

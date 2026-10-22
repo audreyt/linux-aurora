@@ -42,6 +42,11 @@ impl Backend {
     /// scheduler's release to be consumed and parked (the event worker does
     /// both). Poll briefly until the publication's deadline, then name the
     /// state that kept pair `slot` busy.
+    ///
+    /// A borrower (an event pass observing the pair, a preparation or a
+    /// growth) returns the pair under the device mutex and then notifies
+    /// `changed`, usually within microseconds: wait for that notification,
+    /// bounded by one tick, instead of the fixed sleep.
     fn wait_render_busy(&self, slot: u8, wait: Wait) -> Result {
         if wait.expired()? {
             let cause = {
@@ -56,6 +61,16 @@ impl Backend {
             ));
         }
         self.shared.queue_events();
+        {
+            let mut state = self.shared.state.lock();
+            let borrowed = (*state)
+                .as_deref()
+                .is_some_and(|firmware| firmware.queues.render.borrowed(slot));
+            if borrowed {
+                let _ = self.shared.changed.wait_timeout(&mut state, 1);
+                return Ok(());
+            }
+        }
         fsleep(Delta::from_micros(200));
         Ok(())
     }
