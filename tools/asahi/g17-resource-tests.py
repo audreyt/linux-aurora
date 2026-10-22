@@ -34,25 +34,25 @@ def admission_tests(root, source):
      let mut state=State::new();
      for owner in 1..=32 {
       assert!(state.refusal(owner).is_ok());
-      let slot=state.acquire(owner).expect("existing owner fits");
+      let slot=state.acquire(owner,None).expect("existing owner fits");
       state.release(slot);
      }
      assert_eq!(state.active,0,"all submitted work retired");
      let retained=state.owners.iter().filter(|o|**o!=0).count();
      assert_eq!(retained,63);
      assert_eq!(state.refusal(33),Err(ENOSPC));
-     assert!(state.acquire(33).is_none());
+     assert!(state.acquire(33,None).is_none());
      println!("confirmed: 32 open idle owners retain all 63 usable pairs; owner33 receives ENOSPC");
      // Yield one unused spare for each additional logical owner. The runtime
      // separately proves that these physical graphs have never been published.
      for owner in 33..=u64::from(MAX_EXECUTION_CONTEXTS) {
       let slot=(1..cfg::RENDER_SLOTS).find(|slot|state.reassign_unused_spare(*slot as u8,None,Some(owner))).unwrap();
-      assert_eq!(state.acquire(owner),Some(slot as u8));state.release(slot as u8);
+      assert_eq!(state.acquire(owner,None),Some(slot as u8));state.release(slot as u8);
      }
-     for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {let slot=state.acquire(owner,None).unwrap();state.release(slot);}
      assert!(state.owners.iter().all(|owner|*owner<=u64::from(MAX_EXECUTION_CONTEXTS)));
      println!("fixed: all{} logical owners render and resume without reducing slot count or depth",MAX_EXECUTION_CONTEXTS);
-     let mut guarded=State::new();let first=guarded.acquire(1).unwrap();guarded.release(first);
+     let mut guarded=State::new();let first=guarded.acquire(1,None).unwrap();guarded.release(first);
      let spare=guarded.owners.iter().enumerate().find(|(s,o)|**o==1&&*s!=first as usize).unwrap().0;
      guarded.take_idle(spare,1);
      assert!(!guarded.reassign_unused_spare(spare as u8,Some(1),Some(2)),"warm borrower excludes reclamation");
@@ -67,10 +67,10 @@ def admission_tests(root, source):
      assert!(!guarded.reassign_unused_spare(64,None,Some(3)));
      guarded.released |= 1u64<<first;
      assert!(guarded.reassign_unused_spare(first,Some(1),None),"closed owner's unused last slot can be freed for compute");
-     let second=guarded.acquire(3).unwrap();guarded.release(second);
+     let second=guarded.acquire(3,None).unwrap();guarded.release(second);
      let spare3=guarded.owners.iter().enumerate().find(|(s,o)|**o==3&&*s!=second as usize).unwrap().0;
      assert!(guarded.reassign_unused_spare(spare3 as u8,Some(3),Some(2)));
-     let fourth=guarded.acquire(4).unwrap();guarded.release(fourth);
+     let fourth=guarded.acquire(4,None).unwrap();guarded.release(fourth);
      let spare4=guarded.owners.iter().enumerate().find(|(s,o)|**o==4&&*s!=fourth as usize).unwrap().0;
      assert!(!guarded.reassign_unused_spare(spare4 as u8,Some(4),Some(2)),"destination retains at most two channels");
      let mut recency=State::new();recency.owners[9]=1;recency.owners[2]=1;
@@ -78,12 +78,15 @@ def admission_tests(root, source):
      assert_eq!(recency.borrow_warm_sibling(1,9),Some(2));
      assert_eq!(recency.epochs[2],0);assert_eq!(recency.epochs[9],epoch);
      recency.release(2);recency.release(9);
-     for _ in 0..32 {let slot=recency.acquire(1).unwrap();assert_eq!(slot,9);recency.release(slot);}
-     let a=recency.acquire(1).unwrap();let b=recency.acquire(1).unwrap();assert_ne!(a,b);
+     for _ in 0..32 {let slot=recency.acquire(1,None).unwrap();assert_eq!(slot,9);recency.release(slot);}
+     let a=recency.acquire(1,None).unwrap();let b=recency.acquire(1,None).unwrap();assert_ne!(a,b);
+     // A command ordered after the owner's live render follows it onto its pair.
+     let c=recency.acquire(1,Some(a)).unwrap();assert_eq!(c,a,"a dependent render stays on its predecessor's pair");
+     recency.release(c);
      recency.release(b);recency.released|=1u64<<b;
      assert_eq!(recency.borrow_warm_sibling(1,a),None,"never reopen a closed sibling while warming");
      recency.release(a);
-     let mut empty=State::new();let slot=empty.acquire(1).unwrap();
+     let mut empty=State::new();let slot=empty.acquire(1,None).unwrap();
      assert!(!empty.cancel_empty_slot(slot,2));
      empty.refs[slot as usize]+=1;assert!(!empty.cancel_empty_slot(slot,1));empty.release(slot);
      assert!(empty.cancel_empty_slot(slot,1));empty.release(slot);
@@ -91,20 +94,20 @@ def admission_tests(root, source):
      println!("recency: serial work keeps its used pair; overlapping work retains both channels; warm close and empty-reservation races protected");
      println!("guards: live warming, expected owner, remaining usable pair, existing destination, and reserved slots");
      let mut state=State::new();
-     for owner in 1..=32 {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=32 {let slot=state.acquire(owner,None).unwrap();state.release(slot);}
      // Every existing owner still resumes, so this is held capacity, not live GPU work.
-     for owner in 1..=32 {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=32 {let slot=state.acquire(owner,None).unwrap();state.release(slot);}
      // Logical close makes the retained pair eligible; no firmware behavior modeled.
      let slot=state.owners.iter().position(|o|*o==1).unwrap();
      state.released |= 1u64<<slot;
      assert!(state.refusal(33).is_ok());
-     assert_eq!(state.acquire(33),Some(slot as u8));
+     assert_eq!(state.acquire(33,None),Some(slot as u8));
      println!("control: explicitly released idle ownership admits a new owner");
      // Live owners whose siblings were published hold every slot: no spare
      // can yield. The runtime proves each candidate pair idle and installed.
      let candidates=|s:&State|->Vec<(u8,u64)> {(1..cfg::RENDER_SLOTS).filter(|slot|s.owners[*slot]!=0).map(|slot|(slot as u8,s.owners[slot])).collect()};
      let mut live=State::new();
-     for owner in 1..=32 {let slot=live.acquire(owner).unwrap();live.release(slot);}
+     for owner in 1..=32 {let slot=live.acquire(owner,None).unwrap();live.release(slot);}
      assert_eq!(live.refusal(33),Err(ENOSPC));
      let mut gifts=Vec::new();
      for owner in 33..=u64::from(MAX_EXECUTION_CONTEXTS) {
@@ -112,11 +115,11 @@ def admission_tests(root, source):
       let (slot,donor)=live.forfeit_sibling(&candidates(&live),0,owner).expect("an owner with two pairs donates one");
       assert_eq!(live.owners[slot as usize],owner);assert_eq!(live.epochs[slot as usize],0);
       assert_eq!(live.owners.iter().filter(|o|**o==donor).count(),1,"donor keeps exactly one pair");
-      assert_eq!(live.acquire(owner),Some(slot));live.release(slot);
+      assert_eq!(live.acquire(owner,None),Some(slot));live.release(slot);
       gifts.push((slot as usize,donor));
      }
      for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
-      assert!(live.refusal(owner).is_ok());let slot=live.acquire(owner).unwrap();live.release(slot);
+      assert!(live.refusal(owner).is_ok());let slot=live.acquire(owner,None).unwrap();live.release(slot);
      }
      println!("forfeit: all{} live logical owners render while idle siblings move; every donor keeps a pair",MAX_EXECUTION_CONTEXTS);
      // A donor never receives another pair while open: neither free capacity
@@ -126,18 +129,18 @@ def admission_tests(root, source):
      let closed=live.owners.iter().position(|o|*o==u64::from(MAX_EXECUTION_CONTEXTS)).unwrap();
      assert_ne!(given,closed,"control: the released pair was not this donor's");
      live.released|=1u64<<closed;
-     let slot=live.acquire(donor).unwrap();assert_eq!(slot as usize,kept);live.release(slot);
+     let slot=live.acquire(donor,None).unwrap();assert_eq!(slot as usize,kept);live.release(slot);
      assert_eq!(live.owners.iter().filter(|o|**o==donor).count(),1,"no sibling after forfeiting");
      live.released|=1u64<<given;
-     let slot=live.acquire(donor).unwrap();assert_eq!(slot as usize,kept);live.release(slot);
+     let slot=live.acquire(donor,None).unwrap();assert_eq!(slot as usize,kept);live.release(slot);
      assert_ne!(live.owners[given],donor,"a donor never takes back the pair it gave away");
      assert!(live.forfeited.contains(&donor),"the record lasts until the donor closes");
      let undonated=(1..=32).find(|o|!live.forfeited.contains(o)&&*o!=donor&&live.owners.iter().filter(|v|**v==*o).count()==1).unwrap();
-     let slot=live.acquire(undonated).unwrap();live.release(slot);
+     let slot=live.acquire(undonated,None).unwrap();live.release(slot);
      assert_eq!(live.owners.iter().filter(|o|**o==undonated).count(),2,"control: an owner that never donated claims the free sibling");
      // Guards: borrowed, active, quarantined, held, released, last pair, mismatch, recipient state.
      let mut g=State::new();
-     for owner in 1..=2 {let slot=g.acquire(owner).unwrap();g.release(slot);}
+     for owner in 1..=2 {let slot=g.acquire(owner,None).unwrap();g.release(slot);}
      let pairs=|g:&State,o:u64|->Vec<usize> {(0..cfg::RENDER_SLOTS).filter(|s|g.owners[*s]==o).collect()};
      let (a,b)=(pairs(&g,1)[0],pairs(&g,1)[1]);
      g.refs[b]=1;assert_eq!(g.forfeit_sibling(&[(b as u8,1)],0,9),None,"borrowed");g.refs[b]=0;
@@ -158,7 +161,7 @@ def admission_tests(root, source):
      assert_eq!(pairs(&g,2),vec![b]);assert_eq!(g.owners[held],0);
      assert_eq!(g.forfeit_sibling(&[(a as u8,1)],0,3),None,"never take a donor's last pair");
      let mut lru=State::new();
-     for owner in 1..=2 {let slot=lru.acquire(owner).unwrap();lru.release(slot);}
+     for owner in 1..=2 {let slot=lru.acquire(owner,None).unwrap();lru.release(slot);}
      let one=pairs(&lru,1);let two=pairs(&lru,2);
      lru.epochs[one[0]]=7;lru.epochs[one[1]]=9;lru.epochs[two[0]]=8;lru.epochs[two[1]]=3;
      let all=candidates(&lru);
@@ -773,7 +776,7 @@ def forfeit_donor_tests(root, source):
     }
     // One command: admission, then construction and publication on its pair.
     fn render(s:&mut State,m:&mut Model,owner:u64)->u8 {
-     let slot=s.acquire(owner).unwrap_or_else(||panic!("owner {} found no pair",owner));
+     let slot=s.acquire(owner,None).unwrap_or_else(||panic!("owner {} found no pair",owner));
      m.publish(owner,slot as usize);
      slot
     }

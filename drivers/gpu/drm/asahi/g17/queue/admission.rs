@@ -10,7 +10,7 @@
 
 use crate::g17::{
     hazard::{self, Footprint, Plan},
-    job::Packet,
+    job::{Order, Packet},
 };
 use crate::{hw::t8140::queues as cfg, mmu::MAX_EXECUTION_CONTEXTS};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -121,9 +121,19 @@ impl State {
         self.advance(slot);
         slot as u8
     }
-    fn acquire(&mut self, owner: u64) -> Option<u8> {
+    fn acquire(&mut self, owner: u64, follow: Option<u8>) -> Option<u8> {
         if owner == 0 {
             return None;
+        }
+        // A command ordered after the owner's newest live render gains no
+        // concurrency from the sibling: its barrier waits for that render
+        // anyway. Queue it behind it on the same pair, where the queue's own
+        // order replaces a cross-queue firmware dependency.
+        if let Some(slot) = follow {
+            let index = usize::from(slot);
+            self.refs[index] += 1;
+            self.advance(index);
+            return Some(slot);
         }
         // Prefer the owner's idle pair. A missing sibling can be claimed
         // only while this owner has no live kick, before constructing it.
@@ -352,9 +362,37 @@ impl State {
         )
     }
 
-    fn pick(&mut self, owner: u64, plan: Plan) -> Option<u8> {
+    /// The pair holding the owner's newest live render when `request` is
+    /// ordered after that render by its queue prefix, and the pair can take
+    /// another command.
+    fn follow(&self, owner: u64, request: Option<Request<'_>>) -> Option<u8> {
+        let request = request?;
+        let newest = self
+            .footprints
+            .iter()
+            .filter(|entry| entry.owner == owner && entry.slot.is_some())
+            .max_by_key(|entry| entry.sequence)?;
+        if !Order::contains(request.prefix, newest.sequence) {
+            return None;
+        }
+        let slot = newest.slot?;
+        let index = usize::from(slot);
+        let bit = 1u64 << slot;
+        if index >= cfg::RENDER_SLOTS
+            || self.owners[index] != owner
+            || (self.quarantined | self.kill_hold) & bit != 0
+            || self.active & bit == 0
+            || self.refs[index] == 0
+            || self.refs[index] >= cfg::RENDER_DEPTH
+        {
+            return None;
+        }
+        Some(slot)
+    }
+
+    fn pick(&mut self, owner: u64, plan: Plan, follow: Option<u8>) -> Option<u8> {
         match plan {
-            Plan::Any => self.acquire(owner),
+            Plan::Any => self.acquire(owner, follow),
             Plan::Wait => None,
             Plan::Pair(slot) => {
                 let index = usize::from(slot);
@@ -526,7 +564,8 @@ impl Pool {
             } else {
                 state.plan(owner, request, ticket)
             };
-            if let Some(slot) = state.pick(owner, plan) {
+            let follow = state.follow(owner, request);
+            if let Some(slot) = state.pick(owner, plan, follow) {
                 state.forget_waiter(ticket.take());
                 let record =
                     request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -601,7 +640,8 @@ impl Pool {
             return Ok(None);
         }
         let plan = state.plan(owner, request, None);
-        let Some(slot) = state.pick(owner, plan) else {
+        let follow = state.follow(owner, request);
+        let Some(slot) = state.pick(owner, plan, follow) else {
             return Ok(None);
         };
         let record = request.and_then(|request| state.record(owner, Some(slot), 0, request));
