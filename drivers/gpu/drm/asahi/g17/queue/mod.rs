@@ -280,8 +280,7 @@ impl<B: Backend> Queue<B> {
                 checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             }
         }
-        let early = engine == Engine::Render
-            && dependencies.is_empty()
+        let early = dependencies.is_empty()
             && self.frontiers[index].len() < EARLY_DEPTH;
         let packet = Packet::new(
             id,

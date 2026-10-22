@@ -403,7 +403,7 @@ impl<B: Backend> Scheduler<B> {
         };
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
-        if packet.engine() == Engine::Render && !(early && self.backend.try_early(&packet)) {
+        if !(early && self.backend.try_early(&packet)) {
             self.backend.count_backlog(&packet);
         }
         job.push();

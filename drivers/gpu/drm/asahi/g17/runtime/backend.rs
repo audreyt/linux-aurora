@@ -13,7 +13,10 @@ use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
 impl Backend {
     pub(super) fn release_backlog(&self, packet: &Packet) {
         if packet.take_backlog() {
-            self.backlog.fetch_sub(1, Ordering::AcqRel);
+            match packet.engine() {
+                Engine::Render => self.backlog.fetch_sub(1, Ordering::AcqRel),
+                Engine::Compute => self.compute_backlog.fetch_sub(1, Ordering::AcqRel),
+            };
         }
     }
 
@@ -192,11 +195,17 @@ impl job::Backend for Backend {
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {
-        self.try_render_early(packet)
+        match packet.engine() {
+            Engine::Render => self.try_render_early(packet),
+            Engine::Compute => self.try_compute_early(packet),
+        }
     }
 
     fn count_backlog(&self, packet: &Packet) {
         packet.count_backlog();
-        self.backlog.fetch_add(1, Ordering::AcqRel);
+        match packet.engine() {
+            Engine::Render => self.backlog.fetch_add(1, Ordering::AcqRel),
+            Engine::Compute => self.compute_backlog.fetch_add(1, Ordering::AcqRel),
+        };
     }
 }

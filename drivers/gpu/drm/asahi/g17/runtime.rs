@@ -528,7 +528,10 @@ pub(super) struct Backend {
     shared: Arc<super::Shared>,
     pub(super) context: Arc<Context>,
     owner: u64,
+    /// Render packets queued to the scheduler and not yet published.
     backlog: core::sync::atomic::AtomicU32,
+    /// Compute packets queued to the scheduler and not yet published.
+    compute_backlog: core::sync::atomic::AtomicU32,
     /// One compute binder per owner: submission and publication can both bind,
     /// and two concurrent binders could leave the owner with two queues.
     binding: core::sync::atomic::AtomicBool,
@@ -624,6 +627,7 @@ impl Backend {
                     context,
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
+                    compute_backlog: core::sync::atomic::AtomicU32::new(0),
                     binding: core::sync::atomic::AtomicBool::new(false),
                 },
                 GFP_KERNEL,
@@ -1392,6 +1396,125 @@ impl Backend {
                 return Err(self.wait_expired(EBUSY, "a spared compute queue's drain witness"));
             }
             fsleep(Delta::from_millis(1));
+        }
+    }
+
+    /// Publishes a dependency-free compute command from the submitting ioctl,
+    /// as renders are, instead of waking the scheduler's worker for it. Only a
+    /// queue already bound to this owner that fits the command and has room
+    /// qualifies, and only while no earlier compute command of this owner
+    /// still waits in the scheduler, so publication order stays submission
+    /// order. The ioctl never binds, grows, replays or sleeps: any of those
+    /// returns false before anything became visible and leaves the command to
+    /// the scheduler.
+    pub(in crate::g17) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
+        if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+            return false;
+        }
+        let super::command::Validated::Compute { scratch, .. } = &packet.command else {
+            return false;
+        };
+        let Ok(required) =
+            super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())
+        else {
+            return false;
+        };
+        {
+            let state = self.shared.state.lock();
+            let Some(firmware) = (*state).as_deref() else {
+                return false;
+            };
+            if firmware.recovery.pending()
+                || self.binding.load(Ordering::Acquire)
+                || !firmware
+                    .queues
+                    .compute(self.owner)
+                    .is_some_and(|queue| queue.pool_fits(required) && queue.room())
+            {
+                return false;
+            }
+        }
+        if !packet.begin_publication() {
+            packet.completion.fail_unpublished(ECANCELED);
+            packet.set_early_result(Err(ECANCELED));
+            return true;
+        }
+        let mut deferred = match DeferredBatch::publication() {
+            Ok(deferred) => deferred,
+            Err(error) => {
+                if packet.completion.status().get() != 0 {
+                    <Self as super::job::Backend>::fail_vm(self, error);
+                }
+                packet.completion.fail_unpublished(error);
+                packet.set_early_result(Err(error));
+                return true;
+            }
+        };
+        let result = self.publish_compute_early(packet, required, &mut deferred);
+        if matches!(result, Err(error) if error == FALLBACK) && !packet.is_published() {
+            deferred.finish();
+            packet.abandon_publication();
+            return false;
+        }
+        let result = self
+            .finish_publication(packet, result, &mut deferred)
+            .map(|_| ());
+        packet.set_early_result(result);
+        true
+    }
+
+    /// The ioctl's single publication attempt, under one device mutex hold on
+    /// the owner's bound queue. Contention returns `FALLBACK` unpublished.
+    fn publish_compute_early(
+        &self,
+        packet: &Arc<super::job::Packet>,
+        required: usize,
+        deferred: &mut DeferredBatch,
+    ) -> Result {
+        if packet.completion.status().get() != 0 {
+            return Err(EIO);
+        }
+        let lease = self.enter_preparation(Wait::Never)?;
+        match packet.completion.work_state()?.acquire() {
+            Err(error) if error == EBUSY => return Err(FALLBACK),
+            result => {
+                result?;
+            }
+        }
+        let mut state = self.shared.state.lock();
+        let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+        if packet.cancel_requested() {
+            return Err(ECANCELED);
+        }
+        if self.shared.crashed.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
+        if !lease.is_current()
+            || firmware.recovery.pending()
+            || super::recovery::Memory::recovery_state(&firmware.init)? != 0
+            || self.binding.load(Ordering::Acquire)
+            // Replays of recovered commands publish first, from the scheduler.
+            || firmware
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.replay_commands() != 0)
+            || !firmware
+                .queues
+                .compute(self.owner)
+                .is_some_and(|queue| queue.pool_fits(required) && queue.room())
+        {
+            return Err(FALLBACK);
+        }
+        let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
+        match firmware.publish_compute(self.owner, packet.clone(), dependencies.as_slice(), deferred)
+        {
+            Err(error) if !packet.is_published() && [EAGAIN, EBUSY].contains(&error) => {
+                Err(FALLBACK)
+            }
+            result => result,
         }
     }
 
