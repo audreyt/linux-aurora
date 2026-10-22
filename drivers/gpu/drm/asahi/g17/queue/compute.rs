@@ -1806,7 +1806,7 @@ impl Queue {
             }
             let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
             if free < if entry_signal { 4 } else { 3 } {
-                return Err(ENOSPC);
+                return Err(resource_exhausted!("compute item ring"));
             }
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;

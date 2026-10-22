@@ -39,7 +39,7 @@ impl QosIds {
         let mut used = self.used.lock();
         let id = used.trailing_ones();
         if id == 128 {
-            return Err(ENOSPC);
+            return Err(resource_exhausted!("QoS IDs"));
         }
         *used |= 1u128 << id;
         Ok(QosLease {
@@ -388,7 +388,12 @@ impl WorkStateLease {
     }
 
     pub(crate) fn render_slot(&self, pair: u8) -> Result<u32> {
-        self.context.work.lock().render.get(pair).ok_or(ENOSPC)
+        self.context
+            .work
+            .lock()
+            .render
+            .get(pair)
+            .ok_or_else(|| resource_exhausted!("context render channels"))
     }
     pub(crate) fn channel_payload(&self, pair: u8, ordinal: u64) -> Result<u8> {
         self.context

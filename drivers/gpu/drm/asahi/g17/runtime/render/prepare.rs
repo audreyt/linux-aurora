@@ -482,7 +482,7 @@ impl super::super::Backend {
                 if firmware.queues.render.retired.len()
                     == firmware.queues.render.retired.capacity()
                 {
-                    return Err(ENOSPC);
+                    return Err(resource_exhausted!("retired render bindings"));
                 }
                 firmware.queues.teardown.displace(
                     pair.context(),
@@ -589,8 +589,11 @@ impl super::super::Backend {
             // construction and its final device-locked install have finished.
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
+            // Warming is optional: exhausted identities, VA or memory must not
+            // fail a command whose own pair is ready. Its failed construction
+            // leaves the reservation unchanged, as for the primary pair.
             match self.build_render_pair(sibling.slot(), packet, true) {
-                Err(error) if error == EBUSY || error == EAGAIN => {}
+                Err(error) if [EBUSY, EAGAIN, ENOSPC, ENOMEM].contains(&error) => {}
                 result => result?,
             }
         }

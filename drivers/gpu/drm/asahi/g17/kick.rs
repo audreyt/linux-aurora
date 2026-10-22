@@ -182,6 +182,17 @@ impl QueueIds {
         Ok(id)
     }
 
+    /// Leased IDs, render pair identities and compute identities, for diagnostics.
+    pub(crate) fn census(&self) -> (usize, usize, usize) {
+        let compute = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.id.engine == DataMaster::Compute)
+            .count();
+        (self.leased, self.pair_identities(), compute)
+    }
+
     /// Tiling and fragment identities of render pairs, excluding the initial
     /// reservations, which no pair uses.
     fn pair_identities(&self) -> usize {
@@ -349,12 +360,20 @@ impl Queue {
         )?;
         let mut range = t8140::dynamic::LOWER;
         let (low, client) = loop {
-            let low = high.alias_in(
-                alloc.uat.kernel_lower_vm(),
-                range.clone(),
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RW,
-            )?;
+            let low = high
+                .alias_in(
+                    alloc.uat.kernel_lower_vm(),
+                    range.clone(),
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_GPU_SHARED_RW,
+                )
+                .map_err(|error| {
+                    if error == ENOSPC {
+                        resource_exhausted!("shared lower GPU VA (render kick ring)")
+                    } else {
+                        error
+                    }
+                })?;
             let end = low
                 .iova()
                 .checked_add(KICK_RING_SIZE as u64)
@@ -364,6 +383,9 @@ impl Queue {
                 Err(error) if error == ENOSPC && end < range.end => {
                     drop(low);
                     range.start = end;
+                }
+                Err(error) if error == ENOSPC => {
+                    return Err(resource_exhausted!("client GPU VA for a render kick ring"))
                 }
                 Err(error) => return Err(error),
             }

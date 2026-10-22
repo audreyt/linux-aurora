@@ -1332,12 +1332,15 @@ impl Backend {
                 // second queue. Its flag is raised before its first decision.
                 let taken = !self.binding.load(Ordering::Acquire)
                     && firmware.queues.compute(self.owner).is_none()
-                    && firmware.queues.rebind_or_take_over_compute(
+                    && match firmware.queues.rebind_or_take_over_compute(
                         self.owner,
                         &self.context,
                         required,
                         contended,
-                    )?;
+                    ) {
+                        Err(error) if error == ENOSPC => false,
+                        result => result?,
+                    };
                 if !taken {
                     drop(state);
                     drop(lease);

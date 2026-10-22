@@ -90,6 +90,19 @@ impl Pending {
         })
     }
 
+    /// Entries by phase (displaced but open, draining, release published), for diagnostics.
+    pub(crate) fn phases(&self) -> [usize; 3] {
+        let mut phases = [0; 3];
+        for entry in self.entries.iter() {
+            phases[match entry.phase {
+                Phase::Deferred => 0,
+                Phase::Draining => 1,
+                Phase::Released(_) => 2,
+            }] += 1;
+        }
+        phases
+    }
+
     fn find(&self, context: &Arc<Context>) -> Option<usize> {
         self.entries
             .iter()

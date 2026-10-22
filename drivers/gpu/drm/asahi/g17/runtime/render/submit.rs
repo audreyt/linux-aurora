@@ -14,9 +14,11 @@ use kernel::{
     time::{delay::fsleep, Delta},
 };
 
-/// Bound on waiting for render capacity held by other live owners. Capacity
-/// frees when a warming graph finishes construction, when a sibling's published
-/// work retires or times out, or when an owner closes.
+/// Bound on waiting for render capacity held by other live owners: admission
+/// slots, queue IDs, parameter-buffer and counter identities, retired-binding
+/// room and shared GPU VA. Capacity frees when a warming graph is reclaimed or
+/// finishes construction, when published work retires or times out, when a
+/// displaced binding's scheduler release completes, or when an owner closes.
 const RENDER_CAPACITY_WAIT_NS: u64 = 4 * crate::g17::job::TIMEOUT_MS as u64 * 1_000_000;
 
 impl Backend {
@@ -24,13 +26,46 @@ impl Backend {
     /// built or whose siblings are busy. Retry reclamation after their next
     /// release instead of failing the packet; fail only after the bound.
     fn wait_render_capacity(&self, since: &mut Option<u64>) -> Result {
+        use core::sync::atomic::AtomicBool;
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static EXPIRED: AtomicBool = AtomicBool::new(false);
         let now = super::super::now_ns();
+        let first = since.is_none();
         if now.saturating_sub(*since.get_or_insert(now)) >= RENDER_CAPACITY_WAIT_NS {
-            return Err(ENOSPC);
+            if !EXPIRED.swap(true, Ordering::Relaxed) {
+                self.log_render_census("wait expired");
+            }
+            return Err(resource_exhausted!("render capacity held by open owners"));
+        }
+        if first && !STARTED.swap(true, Ordering::Relaxed) {
+            self.log_render_census("wait started");
         }
         self.shared.queue_events();
         fsleep(Delta::from_millis(1));
         Ok(())
+    }
+
+    /// A pair is borrowed, still settling, or waiting for its previous
+    /// scheduler's release to be consumed and parked (the event worker does
+    /// both). Poll briefly; time out only after the capacity bound.
+    fn wait_render_busy(&self, since: &mut Option<u64>) -> Result {
+        let now = super::super::now_ns();
+        if now.saturating_sub(*since.get_or_insert(now)) >= RENDER_CAPACITY_WAIT_NS {
+            return Err(ETIMEDOUT);
+        }
+        self.shared.queue_events();
+        fsleep(Delta::from_micros(200));
+        Ok(())
+    }
+
+    /// Once-per-boot capacity snapshot taken with the device mutex.
+    fn log_render_census(&self, reason: &str) {
+        let state = self.shared.state.lock();
+        if let Some(firmware) = (*state).as_deref() {
+            firmware
+                .queues
+                .log_render_census(reason, firmware.render_ids.in_use());
+        }
     }
 
     pub(in crate::g17) fn render_packet(
@@ -150,8 +185,9 @@ impl Backend {
         packet.completion.attach_render_lease(admission)?;
         let mut state_polls = 0;
         let mut state_delay = 20i64;
-        let mut takeover_polls = 0;
+        let mut busy_since = None;
         let mut recovery_polls = 0;
+        let mut capacity_wait = None;
         loop {
             if packet.cancel_requested() {
                 return Err(ECANCELED);
@@ -190,11 +226,13 @@ impl Backend {
             match self.ensure_render(packet, slot) {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
-                    if takeover_polls == 5000 {
-                        return Err(ETIMEDOUT);
-                    }
-                    takeover_polls += 1;
-                    fsleep(Delta::from_micros(200));
+                    self.wait_render_busy(&mut busy_since)?;
+                    continue;
+                }
+                // Graph or binding resources held by other owners: every failed
+                // build left its reservation unchanged, so retry after a release.
+                Err(error) if error == ENOSPC => {
+                    self.wait_render_capacity(&mut capacity_wait)?;
                     continue;
                 }
                 result => result?,
@@ -215,12 +253,12 @@ impl Backend {
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     } else if error == EBUSY {
-                        if takeover_polls == 5000 {
-                            return Err(ETIMEDOUT);
-                        }
-                        takeover_polls += 1;
-                        fsleep(Delta::from_micros(200));
+                        self.wait_render_busy(&mut busy_since)?;
                     }
+                }
+                // Unpublished: the preparation was discarded and the pair returned.
+                Err(error) if !packet.is_published() && error == ENOSPC => {
+                    self.wait_render_capacity(&mut capacity_wait)?;
                 }
                 result => return result,
             }

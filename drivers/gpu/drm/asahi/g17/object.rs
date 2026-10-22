@@ -335,6 +335,13 @@ impl Allocator<'_> {
             prot,
             cpu,
         )
+        .map_err(|error| {
+            if error == ENOSPC {
+                resource_exhausted!("firmware GPU VA")
+            } else {
+                error
+            }
+        })
     }
 
     /// Allocates a canonical low mapping, which can be aliased at the same
@@ -354,6 +361,13 @@ impl Allocator<'_> {
             prot,
             cpu,
         )
+        .map_err(|error| {
+            if error == ENOSPC {
+                resource_exhausted!("shared lower GPU VA")
+            } else {
+                error
+            }
+        })
     }
 
     /// Place fresh backing at one address in the canonical and both alias VMs.

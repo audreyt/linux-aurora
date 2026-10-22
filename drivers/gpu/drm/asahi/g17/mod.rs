@@ -17,6 +17,26 @@
 //! Completions are signalled after dropping it. Lock order: `Shared::state` -> UAT shared state
 //! -> VM exec lock -> GEM reservation. `RoleState::ack` nests inside nothing.
 
+/// A finite device resource refused an allocation: evaluates to `ENOSPC`.
+/// The first refusal at each call site is reported once per module load,
+/// naming the resource and site, so a client's ENOSPC can be attributed.
+macro_rules! resource_exhausted {
+    ($what:literal) => {{
+        static REPORTED: ::core::sync::atomic::AtomicBool =
+            ::core::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, ::core::sync::atomic::Ordering::Relaxed) {
+            let file = ::core::file!();
+            ::kernel::pr_warn!(
+                "asahi: G17 {} exhausted ({}:{})\n",
+                $what,
+                file.rsplit("asahi/").next().unwrap_or(file),
+                ::core::line!()
+            );
+        }
+        ::kernel::error::code::ENOSPC
+    }};
+}
+
 mod buffer;
 mod channel;
 mod command;

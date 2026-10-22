@@ -368,6 +368,60 @@ impl Registry {
         Ok(true)
     }
 
+    /// One line describing every render capacity pool, for attributing refusals.
+    pub(super) fn log_render_census(&self, reason: &str, render_pools: usize) {
+        let mut census = [0usize; 6];
+        for entry in self.render.entries.iter().flatten() {
+            census[0] += 1;
+            census[1] += usize::from(entry.pair.is_some());
+            census[2] += usize::from(entry.parked.is_some());
+            census[3] += usize::from(entry.constructing || entry.growing);
+            census[4] += usize::from(entry.preparing.is_some());
+            census[5] += usize::from(entry.closed);
+        }
+        let [owned, released, held, quarantined] = self.admission.census();
+        let [deferred, draining, releasing] = self.teardown.phases();
+        let (leased, pair_ids, compute_ids) = self.qids.census();
+        let (metrics, metric_slots) = self.metrics.census();
+        let compute = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .fold([0usize; 2], |[all, bound], queue| {
+                [all + 1, bound + usize::from(queue.owner().is_some())]
+            });
+        pr_warn!(
+            "asahi: G17 render capacity {}: queues={} slots owned={} released={} held={} quarantined={}; entries={} pairs={} parked={} building={} preparing={} closed={}; retired={}/{}; teardown open={} draining={} releasing={}; qids leased={} pair={} compute={}; compute queues={} bound={}; pb ids={}; metrics={}/{}; render pools={}\n",
+            reason,
+            self.admission.queues(),
+            owned,
+            released,
+            held,
+            quarantined,
+            census[0],
+            census[1],
+            census[2],
+            census[3],
+            census[4],
+            census[5],
+            self.render.retired.len(),
+            self.render.retired.capacity(),
+            deferred,
+            draining,
+            releasing,
+            leased,
+            pair_ids,
+            compute_ids,
+            compute[0],
+            compute[1],
+            self.buffers.in_use(),
+            metrics,
+            metric_slots,
+            render_pools,
+        );
+    }
+
     fn has_render_ids(&self, owner: u64) -> bool {
         self.render
             .entries

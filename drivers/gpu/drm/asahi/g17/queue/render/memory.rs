@@ -53,14 +53,22 @@ impl Aliases {
         loop {
             // Descriptor aliases are read-only to GPU consumers; the canonical
             // firmware mapping remains writable for command state updates.
-            let global = object.map_range(
-                alloc.uat.kernel_lower_vm(),
-                source.clone(),
-                range.clone(),
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RO,
-                0,
-            )?;
+            let global = object
+                .map_range(
+                    alloc.uat.kernel_lower_vm(),
+                    source.clone(),
+                    range.clone(),
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_GPU_SHARED_RO,
+                    0,
+                )
+                .map_err(|error| {
+                    if error == ENOSPC {
+                        resource_exhausted!("shared lower GPU VA (render descriptors)")
+                    } else {
+                        error
+                    }
+                })?;
             let address = global.iova();
             let end = address.checked_add(size).ok_or(EOVERFLOW)?;
             match object.map_range(
@@ -80,6 +88,9 @@ impl Aliases {
                 Err(error) if error == ENOSPC && end < range.end => {
                     drop(global);
                     range.start = end;
+                }
+                Err(error) if error == ENOSPC => {
+                    return Err(resource_exhausted!("client GPU VA for render descriptors"))
                 }
                 Err(error) => return Err(error),
             }

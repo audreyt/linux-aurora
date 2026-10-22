@@ -70,6 +70,10 @@ impl BufferIds {
         self.next_token = token + 1;
         token
     }
+    /// Identities held by an owner or a reference, for diagnostics.
+    pub(crate) fn in_use(&self) -> usize {
+        self.entries.iter().filter(|entry| !entry.free()).count()
+    }
     pub(crate) fn allocate_render(&mut self) -> Result<(u8, u64)> {
         let id = if self.returned_count != 0 {
             self.returned_count -= 1;
@@ -78,7 +82,7 @@ impl BufferIds {
             self.entries
                 .iter()
                 .position(|entry| entry.free())
-                .ok_or(ENOSPC)? as u8
+                .ok_or_else(|| resource_exhausted!("parameter-buffer IDs"))? as u8
         };
         if !self.entries[usize::from(id)].free() {
             return Err(EIO);
@@ -111,7 +115,10 @@ impl BufferIds {
         if !entry.owner {
             return Err(EINVAL);
         }
-        entry.references = entry.references.checked_add(1).ok_or(ENOSPC)?;
+        entry.references = entry
+            .references
+            .checked_add(1)
+            .ok_or_else(|| resource_exhausted!("parameter-buffer references"))?;
         Ok((id, entry.token))
     }
     /// Preflight shared completion bookkeeping before any of its counters change.
@@ -168,7 +175,7 @@ impl Scenes {
         (0..fw::SCENES)
             .map(|offset| (self.next + offset) % fw::SCENES)
             .find(|scene| self.owners[scene % fw::SCRATCH_SLOTS].is_none())
-            .ok_or(ENOSPC)
+            .ok_or_else(|| resource_exhausted!("render scene slots"))
     }
     pub(crate) fn commit(&mut self, ordinal: u64, scene: usize) -> Result {
         if self.select(ordinal)? != scene {
@@ -240,7 +247,7 @@ impl Growth {
         let retained = (before.total as usize + cfg::TVB_BLOCK_SLOTS - before.read as usize)
             % cfg::TVB_BLOCK_SLOTS;
         if retained.checked_add(added).ok_or(EOVERFLOW)? >= cfg::TVB_BLOCK_SLOTS {
-            return Err(ENOSPC);
+            return Err(resource_exhausted!("tiler heap block slots"));
         }
         let target = (before.total as usize + added) % cfg::TVB_BLOCK_SLOTS;
         Ok(Self {
@@ -320,7 +327,7 @@ pub(crate) fn compact_alias(
             Err(error) => return Err(error),
         }
     }
-    Err(ENOSPC)
+    Err(resource_exhausted!("client compact GPU VA"))
 }
 
 /// Allocated aliases remain private until the owner installs them in its VM
@@ -465,6 +472,13 @@ impl MetricsIds {
             ],
         }
     }
+    /// Leased counter slots and their total, for diagnostics.
+    pub(crate) fn census(&self) -> (usize, usize) {
+        let used = self.used[0].load(Ordering::Relaxed).count_ones()
+            + (self.used[1].load(Ordering::Relaxed) & ((1u64 << (fw::METRICS_SLOTS - 64)) - 1))
+                .count_ones();
+        (used as usize, fw::METRICS_SLOTS)
+    }
 }
 
 pub(crate) struct MetricsLease {
@@ -505,7 +519,7 @@ impl MetricsLease {
                 break;
             }
         }
-        let slot = selected.ok_or(ENOSPC)?;
+        let slot = selected.ok_or_else(|| resource_exhausted!("performance-counter slots"))?;
         // Construct the lease before any fallible address/view validation so
         // every constructor failure returns the selected bit.
         let mut lease = Self {

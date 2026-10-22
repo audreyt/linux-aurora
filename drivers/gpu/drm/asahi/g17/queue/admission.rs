@@ -438,6 +438,17 @@ impl Pool {
     pub(crate) fn queues(&self) -> usize {
         self.queues.load(Ordering::Acquire) as usize
     }
+    /// Owned, released, exit-held and quarantined slots, for diagnostics.
+    pub(crate) fn census(&self) -> [usize; 4] {
+        let state = self.state.lock();
+        let bits = |mask: u64| (mask & State::MASK).count_ones() as usize;
+        [
+            state.owners[1..].iter().filter(|owner| **owner != 0).count(),
+            bits(state.released),
+            bits(state.kill_hold),
+            bits(state.quarantined),
+        ]
+    }
     pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
         let mut count = self.queues.load(Ordering::Acquire);
         loop {

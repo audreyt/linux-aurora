@@ -29,6 +29,11 @@ impl RenderIds {
             used: [AtomicU64::new(0), AtomicU64::new(1 << 63)],
         }
     }
+    /// Allocated render pool IDs, for diagnostics.
+    pub(crate) fn in_use(&self) -> usize {
+        (self.used[0].load(Ordering::Relaxed).count_ones()
+            + (self.used[1].load(Ordering::Relaxed) & !(1u64 << 63)).count_ones()) as usize
+    }
 }
 struct RenderId {
     slot: u16,
@@ -59,7 +64,7 @@ impl RenderId {
                 }
             }
         }
-        Err(ENOSPC)
+        Err(resource_exhausted!("render free-list IDs"))
     }
 }
 impl Drop for RenderId {
@@ -154,7 +159,14 @@ impl RenderBacking {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
             [render_global, client],
-        )?;
+        )
+        .map_err(|error| {
+            if error == ENOSPC {
+                resource_exhausted!("shared lower GPU VA (render free list)")
+            } else {
+                error
+            }
+        })?;
         let pages = Pages::from_backing(backing, blocks, RunLayout::Render)?;
         Ok(Self {
             _client: client,
