@@ -138,7 +138,9 @@ impl job::Backend for Backend {
             Err(EIO)
         } else {
             match packet.engine() {
-                Engine::Compute => self.compute_packet(&packet, &mut deferred),
+                Engine::Compute => {
+                    self.compute_packet(&packet, &mut deferred, super::Wait::scheduled())
+                }
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };

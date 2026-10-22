@@ -401,6 +401,12 @@ impl Completion {
         Ok(())
     }
 
+    /// An ioctl publication that met contention returns its lease before the
+    /// scheduler publishes the command. Nothing referred to it yet.
+    pub(crate) fn detach_render_lease(&self) -> Option<super::queue::admission::RenderLease> {
+        self.render.lock().take()
+    }
+
     pub(crate) fn render_slot(&self) -> Option<u8> {
         self.render
             .lock()

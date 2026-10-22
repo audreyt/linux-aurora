@@ -179,6 +179,13 @@ impl Packet {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+    /// Gives up a claim taken from the submitting ioctl before the job was
+    /// pushed: nothing became visible, and the scheduler claims it again.
+    pub(crate) fn abandon_publication(&self) {
+        let _ = self
+            .publication
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
     pub(crate) fn mark_published(&self) {
         self.publication.store(2, Ordering::Release);
     }

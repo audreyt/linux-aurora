@@ -32,6 +32,46 @@ const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
 const RECOVERY_SETTLE_POLLS: usize = 200;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
+/// Bound on all contention waits of one publication together: capacity and
+/// identities held by other live owners, borrowed pairs, work states, queue
+/// binding and ring backpressure. Each frees when published work retires or
+/// times out, when warming finishes or is reclaimed, or when an owner closes.
+const PUBLICATION_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
+
+/// Internal result of a publication attempted from the submitting ioctl that
+/// met contention before anything became visible: the scheduler publishes the
+/// command instead. Never returned to userspace.
+pub(super) const FALLBACK: Error = EINPROGRESS;
+
+/// How a publication may wait for contention.
+#[derive(Clone, Copy)]
+pub(super) enum Wait {
+    /// From the scheduler's worker, until one deadline for the whole publication.
+    Until(u64),
+    /// From the submitting ioctl, which holds the logical queue's mutex: never
+    /// sleep for contention, return `FALLBACK`.
+    Never,
+}
+
+impl Wait {
+    pub(super) fn scheduled() -> Self {
+        Self::Until(now_ns().saturating_add(PUBLICATION_WAIT_NS))
+    }
+    /// Before a contention wait: `FALLBACK` when it may not sleep at all,
+    /// otherwise whether the publication's deadline has passed.
+    pub(super) fn expired(self) -> Result<bool> {
+        match self {
+            Self::Never => Err(FALLBACK),
+            Self::Until(deadline) => Ok(now_ns() >= deadline),
+        }
+    }
+    pub(super) fn deadline(self) -> Option<u64> {
+        match self {
+            Self::Never => None,
+            Self::Until(deadline) => Some(deadline),
+        }
+    }
+}
 
 /// Whether a publication with no queue may take another live owner's idle one:
 /// when neither a fresh QID nor surplus render capacity remains, or once its
@@ -551,6 +591,10 @@ impl Backend {
                     drop(slot);
                     drop(state);
                     drop(lease);
+                    // Nothing is visible yet: a signalled creator restarts.
+                    if kernel::current!().signal_pending() {
+                        return Err(ERESTARTSYS);
+                    }
                     shared.queue_events();
                     kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
                 }
@@ -590,9 +634,9 @@ impl Backend {
 
     /// The shared aperture has exactly one builder. Other queues sleep without
     /// holding the device mutex; recovery joins its lease before closing roots.
-    fn shared_compute(&self) -> Result {
+    fn shared_compute(&self, wait: Wait) -> Result {
         loop {
-            let lease = self.shared.preparations.enter(false)?;
+            let lease = self.enter_preparation(wait)?;
             let dev = self.shared.drm()?;
             let uat = {
                 let mut state = self.shared.state.lock();
@@ -614,6 +658,9 @@ impl Backend {
                     if !firmware.queues.compute_building {
                         firmware.queues.compute_building = true;
                         break firmware.uat.clone();
+                    }
+                    if wait.expired()? {
+                        return Err(self.wait_expired(EBUSY, "the shared compute aperture"));
                     }
                     self.shared.changed.wait(&mut state);
                 }
@@ -703,7 +750,7 @@ impl Backend {
         result
     }
 
-    fn grow_compute(&self, required: usize) -> Result {
+    fn grow_compute(&self, required: usize, wait: Wait) -> Result {
         use kernel::time::{delay::fsleep, Delta};
         {
             let state = self.shared.state.lock();
@@ -712,14 +759,13 @@ impl Backend {
                 return Ok(());
             }
         }
-        let lease = self.shared.preparations.enter(false)?;
+        let lease = self.enter_preparation(wait)?;
         let dev = self.shared.drm()?;
         let uat = self.shared.state.lock().as_ref().ok_or(ENODEV)?.uat.clone();
         let alloc = super::object::Allocator { dev: &dev, uat: &uat };
         let mut pages = Some(super::freelist::Pages::compute_sized(&alloc, required)?);
         let mut alias = Some(pages.as_ref().ok_or(EIO)?.map_client(self.context.vm())?);
         let mut deferred = DeferredBatch::publication()?;
-        let started = now_ns();
         loop {
             let result = (|| {
                 let mut state = self.shared.state.lock();
@@ -738,11 +784,13 @@ impl Backend {
             deferred.finish();
             match result {
                 Ok(old) => { drop(old); return Ok(()); }
-                Err(error) if error == EAGAIN && lease.is_current()
-                    && now_ns().saturating_sub(started) < WORK_RING_WAIT_NS => {
-                        self.shared.queue_events();
-                        fsleep(Delta::from_millis(1));
+                Err(error) if error == EAGAIN && lease.is_current() => {
+                    if wait.expired()? {
+                        return Err(self.wait_expired(error, "compute pool growth"));
                     }
+                    self.shared.queue_events();
+                    fsleep(Delta::from_millis(1));
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -753,9 +801,9 @@ impl Backend {
     /// owner's idle queue happens only in publication's device-locked rebind,
     /// which publishes under the same mutex hold. Submission never waits for
     /// or fails on physical capacity: it leaves binding to publication.
-    fn build_compute(&self, required: usize) -> Result {
+    fn build_compute(&self, required: usize, wait: Wait) -> Result {
         loop {
-            match self.shared_compute() {
+            match self.shared_compute(wait) {
                 Err(error) if error == EAGAIN => continue,
                 result => {
                     result?;
@@ -764,7 +812,7 @@ impl Backend {
             }
         }
         loop {
-            let lease = self.shared.preparations.enter(false)?;
+            let lease = self.enter_preparation(wait)?;
             let dev = self.shared.drm()?;
             let (uat, reservation) = {
                 let mut state = self.shared.state.lock();
@@ -778,7 +826,7 @@ impl Backend {
                 }
                 match firmware.queues.rebind_compute(self.owner, &self.context, required)? {
                     Rebind::Done => return Ok(()),
-                    Rebind::Grow => { drop(state); return self.grow_compute(required); }
+                    Rebind::Grow => { drop(state); return self.grow_compute(required, wait); }
                     Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
@@ -1258,11 +1306,61 @@ impl Backend {
     /// reports ENOSPC when no physical queue is free, leaving publication to bind.
     fn ensure_compute(&self, scs_pages: u16) -> Result {
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)?;
-        self.bind_compute(required)
+        // The submit ioctl never sleeps for contention: publication binds.
+        match self.bind_compute(required, Wait::Never) {
+            Err(error) if error == FALLBACK => Err(EAGAIN),
+            result => result,
+        }
+    }
+
+    /// A publication gave up waiting for `what` at its deadline and fails with
+    /// `error`. Names the wait, its source line and the owner, at most once a
+    /// second, so a lost device reported for contention is attributable from
+    /// the kernel log alone. Only reached on that failure path.
+    #[track_caller]
+    pub(super) fn wait_expired(&self, error: Error, what: impl kernel::fmt::Display) -> Error {
+        use core::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+        let now = now_ns();
+        let next = NEXT.load(Ordering::Relaxed);
+        if now < next
+            || NEXT
+                .compare_exchange(next, now + 1_000_000_000, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            return error;
+        }
+        let at = core::panic::Location::caller();
+        dev_warn!(
+            self.shared.dev.as_ref(),
+            "G17 publication of pid {} gave up waiting for {} ({:?}, {}:{}); {} similar since the last report\n",
+            self.context.owner_pid(),
+            what,
+            error,
+            at.file().rsplit("asahi/").next().unwrap_or(at.file()),
+            at.line(),
+            SUPPRESSED.swap(0, Ordering::Relaxed)
+        );
+        error
+    }
+
+    /// The preparation lease. From the ioctl, a recovery that has closed the
+    /// preparation epoch is contention.
+    fn enter_preparation(&self, wait: Wait) -> Result<super::preparation::Lease> {
+        match wait {
+            Wait::Never => self
+                .shared
+                .preparations
+                .try_enter()
+                .map_err(|error| if error == EAGAIN { FALLBACK } else { error }),
+            Wait::Until(_) => self.shared.preparations.enter(false),
+        }
     }
 
     /// EAGAIN while another binder of this owner runs; it binds for both.
-    fn bind_compute(&self, required: usize) -> Result {
+    fn bind_compute(&self, required: usize, wait: Wait) -> Result {
         use kernel::time::{delay::fsleep, Delta};
         if self
             .binding
@@ -1272,9 +1370,8 @@ impl Backend {
             return Err(EAGAIN);
         }
         let _binder = Binder(&self.binding);
-        const SPARED_WAIT_MS: usize = 200;
         let mut deferred = DeferredBatch::publication()?;
-        for _ in 0..SPARED_WAIT_MS {
+        loop {
             let pending = (|| {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -1286,15 +1383,16 @@ impl Backend {
             deferred.finish();
             let pending = pending?;
             if !pending {
-                return self.build_compute(required);
+                return self.build_compute(required, wait);
             }
-            // Other owners continue submitting while this owner gives its
-            // queue-local drain witness time to arrive.
+            // Keep the spared queue and its retained work intact until a later
+            // admission observes its witness. Other owners continue submitting
+            // while this owner gives its queue-local drain witness time to arrive.
+            if wait.expired()? {
+                return Err(self.wait_expired(EBUSY, "a spared compute queue's drain witness"));
+            }
             fsleep(Delta::from_millis(1));
         }
-        // No new command has been accepted. Keep the spared queue and its
-        // retained work intact until a later admission observes its witness.
-        Err(EBUSY)
     }
 
     /// Called after taking this packet's publication claim. All waits and work
@@ -1303,6 +1401,7 @@ impl Backend {
         &self,
         packet: &Arc<super::job::Packet>,
         deferred: &mut DeferredBatch,
+        wait: Wait,
     ) -> Result {
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else {
@@ -1311,15 +1410,29 @@ impl Backend {
         let required =
             super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;
         let mut recovery_polls = 0;
-        let mut outer_wait = None;
-        let mut binding_wait = None;
+        let mut state_delay = 20i64;
         let mut contended = false;
         loop {
             if packet.completion.status().get() != 0 {
                 return Err(EIO);
             }
-            let lease = self.shared.preparations.enter(false)?;
-            packet.completion.work_state()?.acquire()?;
+            let lease = self.enter_preparation(wait)?;
+            // Work states free as this context's earlier commands retire.
+            match packet.completion.work_state()?.acquire() {
+                Err(error) if error == EBUSY => {
+                    drop(lease);
+                    if wait.expired()? {
+                        return Err(self.wait_expired(error, "a free compute work state"));
+                    }
+                    self.shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_micros(state_delay));
+                    state_delay = (state_delay * 2).min(1000);
+                    continue;
+                }
+                result => {
+                    result?;
+                }
+            }
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {
@@ -1338,8 +1451,8 @@ impl Backend {
             }
             let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
             if firmware.recovery.pending() || recovery_state != 0 {
-                if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
+                if wait.expired()? || recovery_polls == RECOVERY_SETTLE_POLLS {
+                    return Err(self.wait_expired(EBUSY, "GPU recovery to settle"));
                 }
                 recovery_polls += 1;
                 drop(state);
@@ -1358,10 +1471,8 @@ impl Backend {
                 // took this idle one. Bind again; a takeover publishes under
                 // the same mutex hold. Capacity frees whenever any queue's
                 // published work retires or times out, so the wait is bounded.
-                let now = now_ns();
-                let since = *binding_wait.get_or_insert(now);
-                if now.saturating_sub(since) >= WORK_RING_WAIT_NS {
-                    return Err(EBUSY);
+                if wait.expired()? {
+                    return Err(self.wait_expired(EBUSY, "a compute queue to bind"));
                 }
                 // An off-lock binder of this owner may hold a reservation or
                 // a queue being re-armed: binding here could give the owner a
@@ -1383,7 +1494,7 @@ impl Backend {
                     // Replays collected above belong to other packets; do not
                     // hold their fences while this one waits for a queue.
                     deferred.finish();
-                    match self.bind_compute(required) {
+                    match self.bind_compute(required, wait) {
                         Ok(()) => {}
                         Err(error) if [ENOSPC, EBUSY, EAGAIN].contains(&error) => {
                             // No released queue, fresh QID or spare: the next
@@ -1409,8 +1520,8 @@ impl Backend {
                 && (firmware.recovery.pending()
                     || super::recovery::Memory::recovery_state(&firmware.init)? != 0)
             {
-                if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
+                if wait.expired()? || recovery_polls == RECOVERY_SETTLE_POLLS {
+                    return Err(self.wait_expired(EBUSY, "GPU recovery to settle"));
                 }
                 recovery_polls += 1;
                 drop(state);
@@ -1420,10 +1531,20 @@ impl Backend {
                 continue;
             }
             if matches!(result, Err(EAGAIN)) && !packet.is_published() {
-                let now = now_ns();
-                let since = *outer_wait.get_or_insert(now);
-                if now.saturating_sub(since) >= WORK_RING_WAIT_NS {
-                    return Err(EBUSY);
+                if wait.expired()? {
+                    let releasing = firmware.queues.compute(self.owner).is_some_and(|queue| {
+                        queue
+                            .pending_switch_from()
+                            .is_some_and(|previous| firmware.queues.teardown.releasing(previous))
+                    });
+                    return Err(self.wait_expired(
+                        EBUSY,
+                        if releasing {
+                            "the previous owner's scheduler release"
+                        } else {
+                            "compute ring room"
+                        },
+                    ));
                 }
                 // Backpressure owns no firmware-visible attempt. Other queues
                 // can submit and the event worker can retire while we sleep.

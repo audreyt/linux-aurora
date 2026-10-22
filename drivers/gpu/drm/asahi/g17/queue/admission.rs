@@ -466,14 +466,26 @@ impl Pool {
             }
         }
     }
+    /// Waits at most until `deadline` (monotonic ns), the bound of the whole
+    /// publication, besides each wait's own budget.
     pub(crate) fn acquire_render(
         self: &Arc<Self>,
         owner: u64,
         request: Option<Request<'_>>,
+        deadline: u64,
     ) -> Result<RenderLease> {
         if owner == 0 {
             return Err(EINVAL);
         }
+        // A wait of at most `budget` jiffies, cut short at the deadline.
+        let capped = |budget: kernel::time::Jiffies| {
+            let left = deadline.saturating_sub(crate::g17::now_ns()) / 1_000_000;
+            budget.min(kernel::time::msecs_to_jiffies(left.min(u64::from(u32::MAX)) as u32))
+        };
+        // The budget left after waiting `timeout` jiffies of which `left` remained.
+        let spend = |budget: kernel::time::Jiffies,
+                     timeout: kernel::time::Jiffies,
+                     left: kernel::time::Jiffies| budget.saturating_sub(timeout.saturating_sub(left));
         let mut state = self.state.lock();
         let mut conflict_budget = kernel::time::msecs_to_jiffies(hazard::WAIT_MS);
         let mut quarantine_budget = kernel::time::msecs_to_jiffies(QUARANTINE_WAIT_MS);
@@ -492,16 +504,19 @@ impl Pool {
                 .position(|id| *id == owner)
                 .is_some_and(|slot| state.quarantined & (1u64 << slot) != 0)
             {
-                if quarantine_budget == 0 {
+                let timeout = capped(quarantine_budget);
+                if timeout == 0 {
                     return Err(EIO);
                 }
                 quarantine_budget = match self
                     .released
-                    .wait_interruptible_timeout(&mut state, quarantine_budget)
+                    .wait_interruptible_timeout(&mut state, timeout)
                 {
                     CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
                     CondVarTimeoutResult::Timeout => 0,
-                    CondVarTimeoutResult::Woken { jiffies } => jiffies,
+                    CondVarTimeoutResult::Woken { jiffies } => {
+                        spend(quarantine_budget, timeout, jiffies)
+                    }
                 };
                 continue;
             }
@@ -531,30 +546,39 @@ impl Pool {
                         }
                     }
                 }
+                let timeout = capped(conflict_budget);
+                if timeout == 0 {
+                    // Out of time for overlap: take any slot without waiting.
+                    expired = true;
+                    continue;
+                }
                 match self
                     .released
-                    .wait_interruptible_timeout(&mut state, conflict_budget)
+                    .wait_interruptible_timeout(&mut state, timeout)
                 {
                     CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
                     CondVarTimeoutResult::Timeout => {
                         conflict_budget = 0;
                         expired = true;
                     }
-                    CondVarTimeoutResult::Woken { jiffies } => conflict_budget = jiffies,
+                    CondVarTimeoutResult::Woken { jiffies } => {
+                        conflict_budget = spend(conflict_budget, timeout, jiffies)
+                    }
                 }
             } else {
                 // Never wait unboundedly in publication: the scheduler watchdog
                 // cannot fail a packet that has not claimed hardware yet.
-                if pick_budget == 0 {
+                let timeout = capped(pick_budget);
+                if timeout == 0 {
                     return Err(EBUSY);
                 }
                 pick_budget = match self
                     .released
-                    .wait_interruptible_timeout(&mut state, pick_budget)
+                    .wait_interruptible_timeout(&mut state, timeout)
                 {
                     CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
                     CondVarTimeoutResult::Timeout => 0,
-                    CondVarTimeoutResult::Woken { jiffies } => jiffies,
+                    CondVarTimeoutResult::Woken { jiffies } => spend(pick_budget, timeout, jiffies),
                 };
             }
         })();

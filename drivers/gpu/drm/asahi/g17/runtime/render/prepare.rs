@@ -74,8 +74,14 @@ struct BuildContext<'a> {
 }
 
 impl super::super::Backend {
-    fn build_render_pair(&self, slot: u8, first: &Arc<Packet>, optional: bool) -> Result {
-        let lease = self.shared.preparations.enter(false)?;
+    fn build_render_pair(
+        &self,
+        slot: u8,
+        first: &Arc<Packet>,
+        optional: bool,
+        wait: super::super::Wait,
+    ) -> Result {
+        let lease = self.enter_preparation(wait)?;
         let dev = self.shared.drm()?;
         let (resources, build) = {
             let mut state = self.shared.state.lock();
@@ -576,8 +582,13 @@ impl super::super::Backend {
         firmware.queues.render.pools.warm(&firmware.init, &pool)
     }
 
-    pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8) -> Result {
-        self.build_render_pair(slot, packet, false)?;
+    pub(super) fn ensure_render(
+        &self,
+        packet: &Arc<Packet>,
+        slot: u8,
+        wait: super::super::Wait,
+    ) -> Result {
+        self.build_render_pair(slot, packet, false, wait)?;
         let sibling = {
             let state = self.shared.state.lock();
             (*state)
@@ -595,8 +606,9 @@ impl super::super::Backend {
             // Warming is optional: exhausted identities, VA or memory must not
             // fail a command whose own pair is ready. Its failed construction
             // leaves the reservation unchanged, as for the primary pair.
-            match self.build_render_pair(sibling.slot(), packet, true) {
-                Err(error) if [EBUSY, EAGAIN, ENOSPC, ENOMEM].contains(&error) => {}
+            match self.build_render_pair(sibling.slot(), packet, true, wait) {
+                Err(error)
+                    if [EBUSY, EAGAIN, ENOSPC, ENOMEM, super::super::FALLBACK].contains(&error) => {}
                 result => result?,
             }
         }
@@ -608,8 +620,9 @@ impl super::super::Backend {
         slot: u8,
         packet: &Arc<Packet>,
         deferred: &mut super::super::DeferredBatch,
+        wait: super::super::Wait,
     ) -> Result {
-        let lease = self.shared.preparations.enter(false)?;
+        let lease = self.enter_preparation(wait)?;
         let dev = self.shared.drm()?;
         let (uat, mut pair, addresses, growth_target) = {
             let mut state = self.shared.state.lock();
