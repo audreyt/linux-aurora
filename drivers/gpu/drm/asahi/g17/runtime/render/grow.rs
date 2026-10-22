@@ -273,6 +273,8 @@ impl crate::g17::Shared {
                 entry.borrowed_dependencies = None;
                 entry.borrowed_switch = None;
                 entry.growing = false;
+                // The grow work item requests an event pass when it finishes.
+                entry.missed_event = false;
             }
             if firmware.queues.render.grow.active != Some(request) {
                 return Err(EIO);

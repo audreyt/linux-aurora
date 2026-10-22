@@ -50,6 +50,9 @@ struct Entry {
     /// nothing, so the snapshot can only be stale towards an older switch.
     borrowed_switch: Option<u64>,
     event_masks: [u64; 2],
+    /// A completion event for this pair arrived while it was borrowed. Event
+    /// passes skip borrowed pairs, so the returning borrower requests another.
+    missed_event: bool,
     closed: bool,
     pending_error: Option<(Arc<crate::g17::status::VmStatus>, Error)>,
     pending_timeout: bool,
@@ -204,6 +207,14 @@ impl RenderState {
             .get_mut(usize::from(slot))
             .and_then(Option::as_mut)
             .ok_or(EIO)
+    }
+
+    /// Whether a completion event arrived while the pair in `slot` was
+    /// borrowed; clears the record. The returned pair is installed again, so
+    /// the next event pass observes it.
+    fn take_missed_event(&mut self, slot: u8) -> bool {
+        self.entry_mut(slot)
+            .is_ok_and(|entry| core::mem::take(&mut entry.missed_event))
     }
 
     fn reserved(&mut self, reservation: Reservation) -> Result<&mut Entry> {
@@ -532,6 +543,7 @@ impl Registry {
                 borrowed_dependencies: None,
                 borrowed_switch: None,
                 event_masks: [0; 2],
+                missed_event: false,
                 closed: false,
                 pending_error: None,
                 pending_timeout: false,
@@ -1062,9 +1074,19 @@ impl Registry {
     }
     pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) {
         for entry in self.render.entries.iter_mut().flatten() {
+            let mut hit = false;
             for id in entry.reservation.ids {
                 let qid = usize::from(id.qid());
-                entry.event_masks[qid / 64] |= masks[qid / 64] & (1u64 << (qid % 64));
+                let bit = masks[qid / 64] & (1u64 << (qid % 64));
+                entry.event_masks[qid / 64] |= bit;
+                hit |= bit != 0;
+            }
+            // Event passes skip a pair while preparation, growth or an
+            // observation has borrowed it. Without a record, a completion
+            // that arrived meanwhile waits for an unrelated later event or the
+            // one-millisecond rescan.
+            if hit && (entry.preparing.is_some() || entry.growing) {
+                entry.missed_event = true;
             }
         }
     }
