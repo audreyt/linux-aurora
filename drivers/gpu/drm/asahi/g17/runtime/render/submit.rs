@@ -62,9 +62,7 @@ impl Backend {
     fn log_render_census(&self, reason: &str) {
         let state = self.shared.state.lock();
         if let Some(firmware) = (*state).as_deref() {
-            firmware
-                .queues
-                .log_render_census(reason, firmware.render_ids.in_use());
+            pr_warn!("asahi: G17 render capacity {}: {}\n", reason, firmware.capacity());
         }
     }
 

@@ -58,6 +58,79 @@ struct Entry {
     published: bool,
 }
 
+/// Counts of every finite queue resource at one instant. Displayed on one line.
+pub(in crate::g17) struct Capacity {
+    queues: usize,
+    contexts: usize,
+    slots: [usize; 4],
+    entries: [usize; 6],
+    retired: [usize; 2],
+    teardown: [usize; 3],
+    qids: (usize, usize, usize),
+    compute: [usize; 3],
+    buffers: usize,
+    metrics: (usize, usize),
+    render_pools: usize,
+    pools: [usize; 3],
+}
+
+// Printed by `pr_warn!` (kernel formatting) and written to debugfs (core formatting).
+impl kernel::fmt::Display for Capacity {
+    fn fmt(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+
+impl core::fmt::Display for Capacity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [owned, released, held, quarantined] = self.slots;
+        let [entries, pairs, parked, building, preparing, closed] = self.entries;
+        let [open, draining, releasing] = self.teardown;
+        let (leased, pair_ids, compute_ids) = self.qids;
+        write!(
+            f,
+            "queues={} contexts={}/{} (closing {}); slots owned={} released={} held={} \
+             quarantined={}; entries={} pairs={} parked={} building={} preparing={} \
+             closed={}; retired={}/{}; teardown open={} draining={} releasing={}; qids \
+             leased={} pair={} compute={}; compute queues={} bound={} pools={} MiB; \
+             pb ids={}; metrics={}/{}; render pools={} (with entries {} totalling {} MiB, \
+             largest {} MiB)",
+            self.queues,
+            self.contexts,
+            crate::mmu::MAX_EXECUTION_CONTEXTS,
+            self.contexts.saturating_sub(self.queues),
+            owned,
+            released,
+            held,
+            quarantined,
+            entries,
+            pairs,
+            parked,
+            building,
+            preparing,
+            closed,
+            self.retired[0],
+            self.retired[1],
+            open,
+            draining,
+            releasing,
+            leased,
+            pair_ids,
+            compute_ids,
+            self.compute[0],
+            self.compute[1],
+            self.compute[2] >> 20,
+            self.buffers,
+            self.metrics.0,
+            self.metrics.1,
+            self.render_pools,
+            self.pools[0],
+            self.pools[1] >> 20,
+            self.pools[2] >> 20,
+        )
+    }
+}
+
 /// Unpublished objects removed together, then destroyed outside the device lock.
 pub(super) struct UnusedRenderSpare {
     _entry: Option<Entry>,
@@ -368,21 +441,17 @@ impl Registry {
         Ok(true)
     }
 
-    /// One line describing every render capacity pool, for attributing refusals.
-    pub(super) fn log_render_census(&self, reason: &str, render_pools: usize) {
-        let mut census = [0usize; 6];
+    /// A snapshot of every finite queue resource, for attributing refusals.
+    pub(in crate::g17) fn capacity(&self, render_pools: usize, contexts: usize) -> Capacity {
+        let mut entries = [0usize; 6];
         for entry in self.render.entries.iter().flatten() {
-            census[0] += 1;
-            census[1] += usize::from(entry.pair.is_some());
-            census[2] += usize::from(entry.parked.is_some());
-            census[3] += usize::from(entry.constructing || entry.growing);
-            census[4] += usize::from(entry.preparing.is_some());
-            census[5] += usize::from(entry.closed);
+            entries[0] += 1;
+            entries[1] += usize::from(entry.pair.is_some());
+            entries[2] += usize::from(entry.parked.is_some());
+            entries[3] += usize::from(entry.constructing || entry.growing);
+            entries[4] += usize::from(entry.preparing.is_some());
+            entries[5] += usize::from(entry.closed);
         }
-        let [owned, released, held, quarantined] = self.admission.census();
-        let [deferred, draining, releasing] = self.teardown.phases();
-        let (leased, pair_ids, compute_ids) = self.qids.census();
-        let (metrics, metric_slots) = self.metrics.census();
         let compute = self
             .compute
             .iter()
@@ -407,39 +476,20 @@ impl Registry {
                 pools[2] = pools[2].max(bytes);
             }
         }
-        pr_warn!(
-            "asahi: G17 render capacity {}: queues={} slots owned={} released={} held={} quarantined={}; entries={} pairs={} parked={} building={} preparing={} closed={}; retired={}/{}; teardown open={} draining={} releasing={}; qids leased={} pair={} compute={}; compute queues={} bound={} pools={} MiB; pb ids={}; metrics={}/{}; render pools={} (with entries {} totalling {} MiB, largest {} MiB)\n",
-            reason,
-            self.admission.queues(),
-            owned,
-            released,
-            held,
-            quarantined,
-            census[0],
-            census[1],
-            census[2],
-            census[3],
-            census[4],
-            census[5],
-            self.render.retired.len(),
-            self.render.retired.capacity(),
-            deferred,
-            draining,
-            releasing,
-            leased,
-            pair_ids,
-            compute_ids,
-            compute[0],
-            compute[1],
-            compute[2] >> 20,
-            self.buffers.in_use(),
-            metrics,
-            metric_slots,
+        Capacity {
+            queues: self.admission.queues(),
+            contexts,
+            slots: self.admission.census(),
+            entries,
+            retired: [self.render.retired.len(), self.render.retired.capacity()],
+            teardown: self.teardown.phases(),
+            qids: self.qids.census(),
+            compute,
+            buffers: self.buffers.in_use(),
+            metrics: self.metrics.census(),
             render_pools,
-            pools[0],
-            pools[1] >> 20,
-            pools[2] >> 20,
-        );
+            pools,
+        }
     }
 
     fn has_render_ids(&self, owner: u64) -> bool {

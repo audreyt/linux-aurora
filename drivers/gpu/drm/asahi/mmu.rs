@@ -2529,6 +2529,12 @@ impl Uat {
         Ok(VmBind(vm.clone(), slot))
     }
 
+    /// Application contexts currently leased, including those of closed queues
+    /// whose scheduler release has not completed.
+    pub(crate) fn execution_contexts_in_use(&self) -> usize {
+        (self.inner.lock().execution_contexts & EXECUTION_CONTEXT_MASK).count_ones() as usize
+    }
+
     /// Allocates a stable application context without changing the VM bind slot.
     /// Both roots and the generation remain unchanged for the lease's lifetime.
     pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionContext>> {

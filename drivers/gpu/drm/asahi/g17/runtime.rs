@@ -509,24 +509,55 @@ impl Backend {
         owner: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
-        let lease = shared.preparations.enter(true)?;
-        let dev = shared.drm()?;
-        let (uat, pool, qos, execution, slot) = {
+        // A closed queue keeps its application context until its scheduler
+        // release is consumed. When only such contexts block this one, wait
+        // for the teardown (bounded) instead of failing a live client; the
+        // preparation lease is not held while sleeping.
+        const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
+        let started = now_ns();
+        let (lease, uat, pool, qos, execution, slot) = loop {
+            let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
-            let slot = firmware.queues.admission.reserve_queue()?;
-            let execution = firmware.uat.new_execution_context(vm)?;
-            (
-                firmware.uat.clone(),
-                firmware.pool.clone(),
-                firmware.queues.qos_ids.clone(),
-                execution,
-                slot,
-            )
+            let slot = firmware.queues.admission.reserve_queue().map_err(|error| {
+                if error == ENOSPC {
+                    resource_exhausted!("logical queues")
+                } else {
+                    error
+                }
+            })?;
+            match firmware.uat.new_execution_context(vm) {
+                Ok(execution) => {
+                    break (
+                        lease,
+                        firmware.uat.clone(),
+                        firmware.pool.clone(),
+                        firmware.queues.qos_ids.clone(),
+                        execution,
+                        slot,
+                    )
+                }
+                Err(error) if error == ENOSPC => {
+                    // Every open queue holds one context; this one is counted
+                    // in `queues()` already but holds none yet.
+                    let open = firmware.queues.admission.queues().saturating_sub(1);
+                    let closing = firmware.uat.execution_contexts_in_use().saturating_sub(open);
+                    if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
+                        return Err(resource_exhausted!("execution contexts"));
+                    }
+                    drop(slot);
+                    drop(state);
+                    drop(lease);
+                    shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
         };
+        let dev = shared.drm()?;
         let alloc = super::object::Allocator {
             dev: &dev,
             uat: &uat,
@@ -1048,6 +1079,11 @@ impl compute::Host for ComputeHost<'_> {
 }
 
 impl super::Firmware {
+    /// One snapshot of every finite queue resource.
+    pub(in crate::g17) fn capacity(&self) -> render::Capacity {
+        self.queues.capacity(self.render_ids.in_use(), self.uat.execution_contexts_in_use())
+    }
+
     fn publish_compute(
         &mut self,
         owner: u64,

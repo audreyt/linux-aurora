@@ -852,7 +852,23 @@ pub(crate) struct Gpu {
     shared: Arc<Shared>,
     _memory: Pin<KBox<kernel::debugfs::File<crate::agx_memory_stats::View>>>,
     _statistics: Pin<KBox<kernel::debugfs::File<StatisticsView>>>,
+    _capacity: Pin<KBox<kernel::debugfs::File<CapacityView>>>,
     _telemetry: Option<telemetry::Telemetry>,
+}
+
+/// One line of queue resource counts, taken with the device mutex. `contexts`
+/// counts leased application contexts against the TTBAT limit; `closing` are
+/// those still held by closed queues whose scheduler release has not completed.
+struct CapacityView(Arc<Shared>);
+
+impl kernel::debugfs::Writer for CapacityView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let state = self.0.state.lock();
+        match (*state).as_deref() {
+            Some(firmware) => writeln!(f, "version=1 {}", firmware.capacity()),
+            None => writeln!(f, "version=1 stopped"),
+        }
+    }
 }
 
 struct StatisticsView(Arc<statistics::Statistics>);
@@ -961,6 +977,10 @@ impl Gpu {
             directory.read_only_file(c"statistics", StatisticsView(report_statistics)),
             GFP_KERNEL,
         )?;
+        let capacity = KBox::pin_init(
+            directory.read_only_file(c"capacity", CapacityView(shared.clone())),
+            GFP_KERNEL,
+        )?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -971,6 +991,7 @@ impl Gpu {
                 shared,
                 _memory: memory,
                 _statistics: statistics,
+                _capacity: capacity,
                 _telemetry: telemetry,
             },
             GFP_KERNEL,
