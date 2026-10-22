@@ -121,6 +121,8 @@ pub(crate) struct Context {
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
     render_blocks: AtomicUsize,
+    /// Timestamp pages of retired compute commands, mapped in this context's VM.
+    compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
@@ -195,11 +197,15 @@ impl Context {
             work_base,
             render,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
+            compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
         self.execution.vm()
+    }
+    pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
+        &self.compute_timestamps
     }
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
