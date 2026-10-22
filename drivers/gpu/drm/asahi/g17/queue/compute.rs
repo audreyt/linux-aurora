@@ -1140,12 +1140,63 @@ impl Queue {
                 }
                 self.retirement_ready = true;
             }
+            // An owner that rebound a detached queue and closed without
+            // publishing left no command for a witness to retire. Without
+            // this the queue keeps that owner, its QID and its VM aliases
+            // until processor stop.
+            if self.previous.is_none()
+                && self.replays.len == 0
+                && self.exit.is_none()
+                && !self.growing
+            {
+                self.retirement_ready = true;
+            }
             if self.retirement_ready {
                 self.owner = None;
                 self.released_at = now_ns();
             }
         }
         Ok(false)
+    }
+    /// Installed, populated and idle under a live owner: no retained, replayed,
+    /// quarantined, exiting, growing or superseded state. Publication on this
+    /// queue holds the device mutex, which the caller also holds, so no command
+    /// can become visible between this check and a takeover.
+    pub(crate) fn idle_owned(&self) -> bool {
+        self.owner.is_some()
+            && !self.released
+            && self.installed
+            && !self.growing
+            && self.pool_phase == PoolPhase::Populated
+            && !self.needs_fresh_backing
+            && self.exit.is_none()
+            && !self.quarantined
+            && !self.awaiting_witness
+            && self.active.len == 0
+            && self.replays.len == 0
+            && self.previous.is_none()
+            && self.binding.is_some()
+    }
+    /// Releases an idle live owner exactly as its logical close would, so that
+    /// `bind_owner` can move the queue. The owner keeps its context and takes a
+    /// queue again before its next publication.
+    pub(crate) fn yield_idle_owner(&mut self) -> Result {
+        if !self.idle_owned() {
+            return Err(EBUSY);
+        }
+        self.released = true;
+        self.retirement_ready = true;
+        self.owner = None;
+        self.released_at = now_ns();
+        Ok(())
+    }
+    /// The bound owner's VM status, for preferring a same-VM takeover.
+    pub(crate) fn bound_status(&self) -> Option<&Arc<VmStatus>> {
+        self.binding.as_ref().map(|binding| binding.context.status())
+    }
+    /// GPU end time of the last retired command, for least-recent selection.
+    pub(crate) fn last_end(&self) -> u64 {
+        self.last_end
     }
     /// The last owner's file and VM are gone: its execution root was released
     /// after the scheduler-state release and command retirement were witnessed

@@ -463,6 +463,9 @@ impl super::super::Backend {
                 if entry.pending_owner != Some(self.owner) || entry.pending_owner_closed {
                     return Err(ECANCELED);
                 }
+                // A pair forfeited by a live owner still names that owner's
+                // scheduler; only its logical close may arm the release.
+                let owner_closed = entry.closed;
                 if firmware.queues.render.retired.len()
                     == firmware.queues.render.retired.capacity()
                 {
@@ -470,7 +473,7 @@ impl super::super::Backend {
                 }
                 firmware.queues.teardown.displace(
                     pair.context(),
-                    true,
+                    owner_closed,
                     super::super::now_ns(),
                 )?;
                 pair.bind_owner(

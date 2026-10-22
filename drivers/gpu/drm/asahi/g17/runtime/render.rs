@@ -303,6 +303,66 @@ impl Registry {
         Ok(None)
     }
 
+    /// Every admission slot is held by a live owner and no unused graph can
+    /// yield: move an idle installed pair from a live owner which keeps another
+    /// installed pair to `owner`. Only the owner's logical binding is released;
+    /// QIDs, backing and the old context's retained graph follow the existing
+    /// rebinding rules, and its scheduler is displaced as still live.
+    pub(super) fn forfeit_idle_render_sibling(&mut self, owner: u64) -> Result<bool> {
+        let mut candidates: KVec<(u8, u64)> = KVec::with_capacity(RENDER_SLOTS, GFP_KERNEL)?;
+        let mut empty = 0u64;
+        for slot in 1..RENDER_SLOTS {
+            let Some(entry) = self.render.entries[slot].as_ref() else {
+                empty |= 1u64 << slot;
+                continue;
+            };
+            if entry.constructing
+                || entry.preparing.is_some()
+                || entry.growing
+                || entry.pending_error.is_some()
+                || entry.pending_timeout
+                || entry.closed
+                || entry.parked.is_some()
+            {
+                continue;
+            }
+            let Some(pair) = entry.pair.as_ref() else {
+                continue;
+            };
+            let Some(donor) = pair.owner() else {
+                continue;
+            };
+            if donor == owner || donor != entry.reservation.owner || !pair.forfeitable()? {
+                continue;
+            }
+            let installed = self
+                .render
+                .entries
+                .iter()
+                .flatten()
+                .filter(|other| {
+                    other.pair.as_ref().is_some_and(|pair| pair.owner() == Some(donor))
+                })
+                .count();
+            if installed < 2 {
+                continue;
+            }
+            candidates
+                .push_within_capacity((slot as u8, donor))
+                .map_err(|_| EIO)?;
+        }
+        let Some((slot, _)) = self.admission.forfeit_sibling(&candidates, empty, owner) else {
+            return Ok(false);
+        };
+        self.render
+            .entry_mut(slot)?
+            .pair
+            .as_mut()
+            .ok_or(EIO)?
+            .release_owner();
+        Ok(true)
+    }
+
     fn has_render_ids(&self, owner: u64) -> bool {
         self.render
             .entries

@@ -129,7 +129,13 @@ impl<B: Backend> Queue<B> {
 
     fn ensure_compute(&mut self, scs_pages: u16) -> Result {
         // Admission is checked even when this queue already owns a scheduler.
-        self.backend.ensure_compute(scs_pages)?;
+        // Physical queues held by other live owners (ENOSPC) and a concurrent
+        // binder of this owner (EAGAIN) are contention, not client errors:
+        // publication binds before the command becomes visible, bounded.
+        match self.backend.ensure_compute(scs_pages) {
+            Err(error) if error == ENOSPC || error == EAGAIN => {}
+            result => result?,
+        }
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,

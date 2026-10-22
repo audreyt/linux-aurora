@@ -17,8 +17,18 @@ use crate::{hw::t8140, mem, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
-/// Minimum render-channel capacity protected from compute-only allocation.
-const COMPUTE_RENDER_RESERVE: usize = 16;
+/// Minimum render identities protected from compute-only allocation.
+const MIN_RENDER_IDENTITIES: usize = 16;
+
+/// Render identities compute leaves free while `queues` logical queues are
+/// open: one pair for each of them, existing pairs included. A published QID
+/// never changes engine (no firmware operation uninstalls one) and a live owner
+/// keeps its last render pair, so render capacity handed to compute could not
+/// be recovered while those owners live. Compute takes any QID beyond this and
+/// changes owners only when none remains.
+fn render_floor(queues: usize) -> usize {
+    MIN_RENDER_IDENTITIES.max(queues.saturating_mul(2)).min(QID_COUNT - 2)
+}
 
 /// Stable physical-channel identity. The owner must not be reused within a
 /// device lifetime, including after an unpublished allocation is cancelled.
@@ -80,12 +90,33 @@ impl QueueIds {
     }
 
     /// Reuses only an exact owner/engine match. Preferred placement is for
-    /// bootstrapping; it does not reserve a partition for an engine.
+    /// bootstrapping; it does not reserve a partition for an engine. Compute
+    /// reservations use `reserve_compute`, which knows the open queues.
     pub(crate) fn reserve(
         &mut self,
         owner: u64,
         engine: DataMaster,
         preferred: Option<u8>,
+    ) -> Result<Id> {
+        self.reserve_for(owner, engine, preferred, 0)
+    }
+
+    /// A compute reservation while `queues` logical queues are open.
+    pub(crate) fn reserve_compute(
+        &mut self,
+        owner: u64,
+        preferred: Option<u8>,
+        queues: usize,
+    ) -> Result<Id> {
+        self.reserve_for(owner, DataMaster::Compute, preferred, queues)
+    }
+
+    fn reserve_for(
+        &mut self,
+        owner: u64,
+        engine: DataMaster,
+        preferred: Option<u8>,
+        queues: usize,
     ) -> Result<Id> {
         if owner == 0 {
             return Err(EINVAL);
@@ -102,46 +133,38 @@ impl QueueIds {
                 Err(EINVAL)
             };
         }
-        let initial = if engine == DataMaster::Compute && self.leased == QID_COUNT {
-            self.initial_render
-                .iter()
-                .copied()
-                .enumerate()
-                .find_map(|(slot, id)| {
-                    id.filter(|id| self.can_cancel_unpublished(*id))
-                        .map(|id| (slot, id))
-                })
+        // Existing render pairs already count towards the reserve. The initial
+        // reservations do not: no render pair can use them, so compute may
+        // replace an unpublished one instead of taking reserved capacity.
+        // Published identities always retain their original lifetime rules.
+        let initial = if engine == DataMaster::Compute {
+            let need = render_floor(queues).saturating_sub(self.pair_identities());
+            if QID_COUNT - self.leased > need {
+                None
+            } else {
+                Some(
+                    self.initial_render
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .find_map(|(slot, id)| {
+                            id.filter(|id| self.can_cancel_unpublished(*id))
+                                .map(|id| (slot, id))
+                        })
+                        .ok_or(ENOSPC)?,
+                )
+            }
         } else {
             None
         };
-        // Existing render identities already satisfy this reservation. Counting
-        // them twice can refuse compute even while physical QIDs remain free.
-        // Published identities always retain their original lifetime rules.
-        if engine == DataMaster::Compute {
-            let render = self
-                .entries
-                .iter()
-                .flatten()
-                .filter(|entry| {
-                    matches!(entry.id.engine, DataMaster::Tiling | DataMaster::Fragment)
-                })
-                .count();
-            // Replacing an initial reservation consumes one render identity.
-            // Include that transition when protecting render's minimum, and
-            // count the replacement as available compute capacity.
-            let replacement = usize::from(initial.is_some());
-            if QID_COUNT - self.leased + replacement
-                <= COMPUTE_RENDER_RESERVE.saturating_sub(render - replacement)
-            {
-                return Err(ENOSPC);
-            }
-        }
-        let index = preferred
-            .map(usize::from)
-            .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
-            .or_else(|| self.entries.iter().position(Option::is_none))
-            .or_else(|| initial.map(|(_, id)| usize::from(id.qid)))
-            .ok_or(ENOSPC)?;
+        let index = match initial {
+            Some((_, id)) => usize::from(id.qid),
+            None => preferred
+                .map(usize::from)
+                .filter(|index| self.entries.get(*index).is_some_and(Option::is_none))
+                .or_else(|| self.entries.iter().position(Option::is_none))
+                .ok_or(ENOSPC)?,
+        };
         let id = Id {
             qid: index as u8,
             owner,
@@ -157,6 +180,36 @@ impl QueueIds {
             self.leased += 1;
         }
         Ok(id)
+    }
+
+    /// Tiling and fragment identities of render pairs, excluding the initial
+    /// reservations, which no pair uses.
+    fn pair_identities(&self) -> usize {
+        let render = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| matches!(entry.id.engine, DataMaster::Tiling | DataMaster::Fragment))
+            .count();
+        render.saturating_sub(self.initial_render.iter().flatten().count())
+    }
+
+    /// Render identities beyond the reserve for `queues` open queues. Only
+    /// these become compute capacity when an unused render reservation is
+    /// cancelled.
+    pub(crate) fn render_surplus(&self, queues: usize) -> usize {
+        self.pair_identities().saturating_sub(render_floor(queues))
+    }
+
+    /// A compute reservation would succeed now: a fresh QID beyond the render
+    /// reserve, or a replaceable initial reservation.
+    pub(crate) fn compute_available(&self, queues: usize) -> bool {
+        QID_COUNT - self.leased > render_floor(queues).saturating_sub(self.pair_identities())
+            || self
+                .initial_render
+                .iter()
+                .flatten()
+                .any(|id| self.can_cancel_unpublished(*id))
     }
 
     /// Ordered under the device mutex; no atomic operation on the submission path.

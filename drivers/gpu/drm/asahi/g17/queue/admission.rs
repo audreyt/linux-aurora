@@ -46,6 +46,10 @@ struct InFlight {
 }
 
 const QUARANTINE_WAIT_MS: u32 = 1000;
+/// Bound on waiting for a lease of this owner's own pairs (all at depth) or a
+/// transiently borrowed free slot. Every awaited lease belongs to published
+/// work, which retires or is failed by its watchdog well within this time.
+const PICK_WAIT_MS: u32 = 4 * crate::g17::job::TIMEOUT_MS;
 
 struct State {
     active: u64,
@@ -58,6 +62,13 @@ struct State {
     epoch: u64,
     footprints: KVec<InFlight>,
     next_ticket: u64,
+    /// Live owners that gave a sibling pair to a refused owner. They keep
+    /// their remaining pair and never receive another while they are open,
+    /// not even the one they gave away. Their work-state channel ordinals stay
+    /// bound to the pairs they published on, and the displaced graph of the
+    /// given pair stays retained for their scheduler until its own release:
+    /// their scheduler must not get a second graph on that pair before then.
+    forfeited: [u64; cfg::RENDER_SLOTS],
 }
 impl State {
     const MASK: u64 = (u64::MAX >> (64 - cfg::RENDER_SLOTS)) & !1;
@@ -73,6 +84,7 @@ impl State {
             epoch: 0,
             footprints: KVec::new(),
             next_ticket: 1,
+            forfeited: [0; cfg::RENDER_SLOTS],
         }
     }
     fn exhausted(&self) -> bool {
@@ -159,7 +171,9 @@ impl State {
         Some(first)
     }
     fn claim_sibling(&mut self, owner: u64) {
-        if self.owners.iter().filter(|id| **id == owner).count() >= cfg::RENDER_PAIRS_PER_OWNER {
+        if self.owners.iter().filter(|id| **id == owner).count() >= cfg::RENDER_PAIRS_PER_OWNER
+            || self.forfeited.contains(&owner)
+        {
             return;
         }
         let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
@@ -222,6 +236,64 @@ impl State {
         self.released &= !bit;
         self.epochs[slot] = 0;
         true
+    }
+    /// A refused owner without any pair takes the least recently used idle
+    /// pair of a live owner which keeps another usable pair. `candidates` are
+    /// the slots whose physical pair the device lock proved idle, with the
+    /// owner bound to that pair; `empty` are the slots without any physical
+    /// identities. The recipient gives back its empty, unborrowed slots and ends
+    /// with exactly the received pair. Returns the slot and the donor.
+    fn forfeit_sibling(
+        &mut self,
+        candidates: &[(u8, u64)],
+        empty: u64,
+        owner: u64,
+    ) -> Option<(u8, u64)> {
+        if owner == 0
+            || (0..cfg::RENDER_SLOTS).any(|slot| {
+                self.owners[slot] == owner
+                    && (empty & (1u64 << slot) == 0
+                        || self.refs[slot] != 0
+                        || (self.quarantined | self.kill_hold) & (1u64 << slot) != 0)
+            })
+        {
+            return None;
+        }
+        let record = self.forfeited.iter().position(|value| *value == 0)?;
+        let blocked = self.active | self.quarantined | self.kill_hold | self.released;
+        let (slot, donor) = candidates
+            .iter()
+            .copied()
+            .filter(|(slot, donor)| {
+                let slot = usize::from(*slot);
+                let bit = 1u64 << slot;
+                slot != 0
+                    && slot < cfg::RENDER_SLOTS
+                    && *donor != 0
+                    && *donor != owner
+                    && self.owners[slot] == *donor
+                    && self.refs[slot] == 0
+                    && blocked & bit == 0
+                    && self.owners.iter().enumerate().any(|(other, value)| {
+                        other != slot
+                            && *value == *donor
+                            && (self.quarantined | self.kill_hold) & (1u64 << other) == 0
+                    })
+            })
+            .min_by_key(|(slot, _)| (self.epochs[usize::from(*slot)], *slot))?;
+        if !self.forfeited.contains(&donor) {
+            self.forfeited[record] = donor;
+        }
+        for other in 0..cfg::RENDER_SLOTS {
+            if self.owners[other] == owner {
+                self.owners[other] = 0;
+                self.released &= !(1u64 << other);
+                self.epochs[other] = 0;
+            }
+        }
+        self.owners[usize::from(slot)] = owner;
+        self.epochs[usize::from(slot)] = 0;
+        Some((slot, donor))
     }
     fn warmable_sibling(&self, owner: u64, publishing: u8) -> Option<u8> {
         if self.refs.get(usize::from(publishing)) != Some(&1) {
@@ -362,6 +434,10 @@ impl Pool {
             GFP_KERNEL,
         )
     }
+    /// Open logical queues, each of which may need a render pair.
+    pub(crate) fn queues(&self) -> usize {
+        self.queues.load(Ordering::Acquire) as usize
+    }
     pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
         let mut count = self.queues.load(Ordering::Acquire);
         loop {
@@ -390,6 +466,7 @@ impl Pool {
         let mut state = self.state.lock();
         let mut conflict_budget = kernel::time::msecs_to_jiffies(hazard::WAIT_MS);
         let mut quarantine_budget = kernel::time::msecs_to_jiffies(QUARANTINE_WAIT_MS);
+        let mut pick_budget = kernel::time::msecs_to_jiffies(PICK_WAIT_MS);
         let mut expired = false;
         let mut ticket = None;
         let result = (|| loop {
@@ -454,8 +531,20 @@ impl Pool {
                     }
                     CondVarTimeoutResult::Woken { jiffies } => conflict_budget = jiffies,
                 }
-            } else if self.released.wait_interruptible(&mut state) {
-                return Err(ERESTARTSYS);
+            } else {
+                // Never wait unboundedly in publication: the scheduler watchdog
+                // cannot fail a packet that has not claimed hardware yet.
+                if pick_budget == 0 {
+                    return Err(EBUSY);
+                }
+                pick_budget = match self
+                    .released
+                    .wait_interruptible_timeout(&mut state, pick_budget)
+                {
+                    CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                    CondVarTimeoutResult::Timeout => 0,
+                    CondVarTimeoutResult::Woken { jiffies } => jiffies,
+                };
             }
         })();
         state.forget_waiter(ticket);
@@ -515,12 +604,24 @@ impl Pool {
     pub(crate) fn owns_slot(&self, owner: u64, slot: usize) -> bool {
         self.state.lock().owners.get(slot) == Some(&owner)
     }
+    /// The caller holds the device mutex, which proved every candidate pair idle.
+    pub(crate) fn forfeit_sibling(
+        &self,
+        candidates: &[(u8, u64)],
+        empty: u64,
+        owner: u64,
+    ) -> Option<(u8, u64)> {
+        self.state.lock().forfeit_sibling(candidates, empty, owner)
+    }
     pub(crate) fn release_owner(&self, owner: u64) {
         let mut state = self.state.lock();
         for slot in 0..cfg::RENDER_SLOTS {
             if state.owners[slot] == owner {
                 state.released |= 1u64 << slot;
             }
+        }
+        for value in state.forfeited.iter_mut().filter(|value| **value == owner) {
+            *value = 0;
         }
         drop(state);
         self.released.notify_all();

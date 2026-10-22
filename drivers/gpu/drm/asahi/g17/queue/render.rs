@@ -1623,6 +1623,19 @@ impl Pair {
             && previous_ready
             && self.idle_for_context(self.context())?)
     }
+    /// Idle under a live owner and reusable as soon as that owner is released:
+    /// no prepared, active, replayed, quarantined, displaced or unsettled
+    /// superseded state, so a successor needs no firmware witness first.
+    pub(crate) fn forfeitable(&self) -> Result<bool> {
+        let previous_ready = self
+            .previous
+            .as_ref()
+            .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
+        Ok(self.owner.is_some()
+            && self.displaced.is_none()
+            && previous_ready
+            && self.idle_for_context(self.context())?)
+    }
     /// Logical close leaves the physical channel identity and backing retained.
     pub(crate) fn release_owner(&mut self) {
         self.owner = None;

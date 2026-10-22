@@ -33,6 +33,15 @@ const FIRST_COMPUTE_QID: u8 = 4;
 const RECOVERY_SETTLE_POLLS: usize = 200;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
 
+/// Whether a publication with no queue may take another live owner's idle one:
+/// when neither a fresh QID nor surplus render capacity remains, or once its
+/// own off-lock attempt (`contended`) found no released queue, fresh QID or
+/// reclaimable render spare. Surplus held by installed render pairs never
+/// becomes compute capacity, so it alone must not keep a publication waiting.
+fn takeover_allowed(compute_available: bool, render_surplus: usize, contended: bool) -> bool {
+    contended || (!compute_available && render_surplus < 2)
+}
+
 /// A reservation remains identifiable while its backing is built without the
 /// device mutex. Failed construction returns the slot, never its host identity.
 #[derive(Clone, Copy)]
@@ -93,7 +102,7 @@ impl Registry {
             compute_building: false,
             compute_scheduler_building: false,
             replay_outer_wait: None,
-            observations: compute::retirement::Batch::new()?,
+            observations <- compute::retirement::Batch::new(),
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
         })
@@ -144,6 +153,77 @@ impl Registry {
             return Ok(Rebind::Done);
         }
         Ok(vacant.map_or(Rebind::Fresh, Rebind::Rearm))
+    }
+
+    /// No fresh QID and no released queue remain: move the least recently used
+    /// idle queue of another live owner to `owner`, preferring one bound to the
+    /// same VM. Only a pool that already fits is taken; growth would have to
+    /// wait for a publication of the new owner. The previous owner keeps its
+    /// context and takes a queue again at its next publication.
+    pub(super) fn take_over_idle_compute(
+        &mut self,
+        owner: u64,
+        context: &Arc<Context>,
+        required: usize,
+    ) -> Result<bool> {
+        if !context.is_current() {
+            return Err(EFAULT);
+        }
+        let mut selected = None::<(bool, u64, usize)>;
+        for (index, entry) in self.compute.iter().enumerate() {
+            let Some(queue) = entry.as_ref().and_then(|entry| entry.queue.as_deref()) else {
+                continue;
+            };
+            if queue.owner() == Some(owner) || !queue.idle_owned() || !queue.pool_fits(required) {
+                continue;
+            }
+            let foreign = !queue
+                .bound_status()
+                .is_some_and(|status| Arc::ptr_eq(status, context.status()));
+            let key = (foreign, queue.last_end(), index);
+            if selected.is_none_or(|best| key < best) {
+                selected = Some(key);
+            }
+        }
+        let Some((_, _, index)) = selected else {
+            return Ok(false);
+        };
+        let queue = self.compute[index]
+            .as_mut()
+            .and_then(|entry| entry.queue.as_deref_mut())
+            .ok_or(EIO)?;
+        queue.yield_idle_owner()?;
+        queue.bind_owner(owner, context.clone())?;
+        Ok(true)
+    }
+
+    /// Publication's device-locked binding: a released queue that fits, or a
+    /// takeover when neither a fresh QID nor surplus render capacity remains,
+    /// or once an off-lock attempt of this publication (`contended`) found no
+    /// released queue, fresh QID or reclaimable render spare. Render surplus
+    /// held by installed pairs cannot become compute capacity, so it must not
+    /// keep a publication from taking an idle queue. False leaves
+    /// construction, re-arming or growth to the off-lock path.
+    pub(super) fn rebind_or_take_over_compute(
+        &mut self,
+        owner: u64,
+        context: &Arc<Context>,
+        required: usize,
+        contended: bool,
+    ) -> Result<bool> {
+        match self.rebind_compute(owner, context, required)? {
+            Rebind::Done => Ok(true),
+            Rebind::Fresh
+                if takeover_allowed(
+                    self.qids.compute_available(self.admission.queues()),
+                    self.qids.render_surplus(self.admission.queues()),
+                    contended,
+                ) =>
+            {
+                self.take_over_idle_compute(owner, context, required)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Installs fresh USC backing into the vacant queue `qid`; the caller writes
@@ -308,7 +388,7 @@ impl Registry {
         let identity = self.identities.reserve(1)?.start;
         let id = self
             .qids
-            .reserve(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID))
+            .reserve_compute(identity, Some(FIRST_COMPUTE_QID), self.admission.queues())
             .map_err(|error| self.compute_admission_error(error))?;
         let reservation = ComputeReservation { slot, id, owner };
         self.compute[slot] = Some(ComputeEntry {
@@ -393,6 +473,17 @@ pub(super) struct Backend {
     pub(super) context: Arc<Context>,
     owner: u64,
     backlog: core::sync::atomic::AtomicU32,
+    /// One compute binder per owner: submission and publication can both bind,
+    /// and two concurrent binders could leave the owner with two queues.
+    binding: core::sync::atomic::AtomicBool,
+}
+
+/// Clears the owner's compute-binder flag on every exit.
+struct Binder<'a>(&'a core::sync::atomic::AtomicBool);
+impl Drop for Binder<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Backend {
@@ -442,6 +533,7 @@ impl Backend {
                     context,
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
+                    binding: core::sync::atomic::AtomicBool::new(false),
                 },
                 GFP_KERNEL,
             )?,
@@ -609,9 +701,12 @@ impl Backend {
         }
     }
 
+    /// Off-lock binding: a released queue, a re-armed vacant one, growth, or a
+    /// fresh QID. ENOSPC leaves the owner unbound. Taking over another live
+    /// owner's idle queue happens only in publication's device-locked rebind,
+    /// which publishes under the same mutex hold. Submission never waits for
+    /// or fails on physical capacity: it leaves binding to publication.
     fn build_compute(&self, required: usize) -> Result {
-        const POOL_RELEASE_WAIT_NS: u64 = 200_000_000;
-        let mut pool_release_wait = None;
         loop {
             match self.shared_compute() {
                 Err(error) if error == EAGAIN => continue,
@@ -641,25 +736,30 @@ impl Backend {
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
                             Ok(reservation) => reservation,
+                            // A pool release is still in flight: the event worker
+                            // observes it and drops the vacated backing off this
+                            // mutex. The caller retries after it.
                             Err(error) if error == EAGAIN => {
-                                // The event worker owns release observation and
-                                // drops vacated aliases/backing off this mutex.
-                                let since = *pool_release_wait.get_or_insert(now_ns());
                                 drop(state);
-                                drop(lease);
                                 self.shared.queue_events();
-                                if now_ns().saturating_sub(since) >= POOL_RELEASE_WAIT_NS {
-                                    return Err(EBUSY);
-                                }
-                                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
-                                continue;
+                                return Err(ENOSPC);
                             }
                             Err(error) if error == ENOSPC => {
-                                let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
-                                drop(state);
+                                // Cancelling an unused render reservation frees
+                                // compute capacity only beyond the render reserve.
+                                let surplus = firmware
+                                    .queues
+                                    .qids
+                                    .render_surplus(firmware.queues.admission.queues());
+                                let reclaimed = if surplus >= 2 {
+                                    firmware.queues.reclaim_unused_render_spare(None, true)?
+                                } else {
+                                    None
+                                };
                                 if reclaimed.is_none() {
                                     return Err(error);
                                 }
+                                drop(state);
                                 drop(reclaimed);
                                 continue;
                             }
@@ -1093,9 +1193,24 @@ impl super::Firmware {
 }
 
 impl Backend {
+    /// Submission-time binding: never takes over another owner's queue and
+    /// reports ENOSPC when no physical queue is free, leaving publication to bind.
     fn ensure_compute(&self, scs_pages: u16) -> Result {
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)?;
+        self.bind_compute(required)
+    }
+
+    /// EAGAIN while another binder of this owner runs; it binds for both.
+    fn bind_compute(&self, required: usize) -> Result {
         use kernel::time::{delay::fsleep, Delta};
+        if self
+            .binding
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(EAGAIN);
+        }
+        let _binder = Binder(&self.binding);
         const SPARED_WAIT_MS: usize = 200;
         let mut deferred = DeferredBatch::publication()?;
         for _ in 0..SPARED_WAIT_MS {
@@ -1129,8 +1244,15 @@ impl Backend {
         deferred: &mut DeferredBatch,
     ) -> Result {
         packet.check_dependencies()?;
+        let super::command::Validated::Compute { scratch, .. } = &packet.command else {
+            return Err(EINVAL);
+        };
+        let required =
+            super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;
         let mut recovery_polls = 0;
         let mut outer_wait = None;
+        let mut binding_wait = None;
+        let mut contended = false;
         loop {
             if packet.completion.status().get() != 0 {
                 return Err(EIO);
@@ -1166,6 +1288,51 @@ impl Backend {
                 continue;
             }
             firmware.replay_compute(deferred)?;
+            if !firmware
+                .queues
+                .compute(self.owner)
+                .is_some_and(|queue| queue.pool_fits(required))
+            {
+                // Submission found no free physical queue, or another owner
+                // took this idle one. Bind again; a takeover publishes under
+                // the same mutex hold. Capacity frees whenever any queue's
+                // published work retires or times out, so the wait is bounded.
+                let now = now_ns();
+                let since = *binding_wait.get_or_insert(now);
+                if now.saturating_sub(since) >= WORK_RING_WAIT_NS {
+                    return Err(EBUSY);
+                }
+                // An off-lock binder of this owner may hold a reservation or
+                // a queue being re-armed: binding here could give the owner a
+                // second queue. Its flag is raised before its first decision.
+                let taken = !self.binding.load(Ordering::Acquire)
+                    && firmware.queues.compute(self.owner).is_none()
+                    && firmware.queues.rebind_or_take_over_compute(
+                        self.owner,
+                        &self.context,
+                        required,
+                        contended,
+                    )?;
+                if !taken {
+                    drop(state);
+                    drop(lease);
+                    // Replays collected above belong to other packets; do not
+                    // hold their fences while this one waits for a queue.
+                    deferred.finish();
+                    match self.bind_compute(required) {
+                        Ok(()) => {}
+                        Err(error) if [ENOSPC, EBUSY, EAGAIN].contains(&error) => {
+                            // No released queue, fresh QID or spare: the next
+                            // locked attempt may take an idle queue over.
+                            contended |= error != EAGAIN;
+                            self.shared.queue_events();
+                            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
+            }
             let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
             let result = firmware.publish_compute(
                 self.owner,

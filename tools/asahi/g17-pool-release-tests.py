@@ -71,6 +71,13 @@ impl QueueIds {
         self.free = false;
         Ok(Id { qid: preferred.unwrap() })
     }
+    fn reserve_compute(&mut self, owner: u64, preferred: Option<u8>, _queues: usize) -> Result<Id> {
+        self.reserve(owner, DataMaster::Compute, preferred)
+    }
+}
+struct Admission;
+impl Admission {
+    fn queues(&self) -> usize { 0 }
 }
 struct Identities { next: u64 }
 impl Identities {
@@ -83,6 +90,7 @@ struct Registry {
     compute: Vec<Option<ComputeEntry>>,
     identities: Identities,
     qids: QueueIds,
+    admission: Admission,
 }
 impl Registry {
 METHODS
@@ -99,7 +107,7 @@ fn state(phase: PoolPhase, free: bool) -> Registry {
         }));
     }
     entries.push(None);
-    Registry { compute: entries, identities: Identities { next: 100 }, qids: QueueIds { free, fail: None } }
+    Registry { compute: entries, identities: Identities { next: 100 }, qids: QueueIds { free, fail: None }, admission: Admission }
 }
 fn main() {
     // Captured failure: four idle released queues, full physical namespace,

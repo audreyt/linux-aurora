@@ -14,7 +14,25 @@ use kernel::{
     time::{delay::fsleep, Delta},
 };
 
+/// Bound on waiting for render capacity held by other live owners. Capacity
+/// frees when a warming graph finishes construction, when a sibling's published
+/// work retires or times out, or when an owner closes.
+const RENDER_CAPACITY_WAIT_NS: u64 = 4 * crate::g17::job::TIMEOUT_MS as u64 * 1_000_000;
+
 impl Backend {
+    /// Every slot or QID is held by live owners whose spares are still being
+    /// built or whose siblings are busy. Retry reclamation after their next
+    /// release instead of failing the packet; fail only after the bound.
+    fn wait_render_capacity(&self, since: &mut Option<u64>) -> Result {
+        let now = super::super::now_ns();
+        if now.saturating_sub(*since.get_or_insert(now)) >= RENDER_CAPACITY_WAIT_NS {
+            return Err(ENOSPC);
+        }
+        self.shared.queue_events();
+        fsleep(Delta::from_millis(1));
+        Ok(())
+    }
+
     pub(in crate::g17) fn render_packet(
         &self,
         packet: &Arc<Packet>,
@@ -35,6 +53,7 @@ impl Backend {
             let state = self.shared.state.lock();
             (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
         };
+        let mut capacity_wait = None;
         loop {
             if packet.cancel_requested() {
                 return Err(ECANCELED);
@@ -48,16 +67,20 @@ impl Backend {
                 match pool.acquire_render(self.owner, Request::of(packet)) {
                     Ok(lease) => lease,
                     Err(error) if error == ENOSPC => {
-                        let reclaimed = {
+                        // Live owners hold every slot. Prefer unused warming,
+                        // then an idle sibling of an owner keeping another pair.
+                        let (reclaimed, forfeited) = {
                             let mut state = self.shared.state.lock();
-                            (*state)
-                                .as_deref_mut()
-                                .ok_or(ENODEV)?
-                                .queues
-                                .reclaim_unused_render_spare(Some(self.owner), false)?
+                            let queues = &mut (*state).as_deref_mut().ok_or(ENODEV)?.queues;
+                            let reclaimed =
+                                queues.reclaim_unused_render_spare(Some(self.owner), false)?;
+                            let forfeited = reclaimed.is_none()
+                                && queues.forfeit_idle_render_sibling(self.owner)?;
+                            (reclaimed, forfeited)
                         };
-                        if reclaimed.is_none() {
-                            return Err(error);
+                        if reclaimed.is_none() && !forfeited {
+                            self.wait_render_capacity(&mut capacity_wait)?;
+                            continue;
                         }
                         drop(reclaimed);
                         continue;
@@ -83,15 +106,23 @@ impl Backend {
                         return Err(error);
                     }
                     if !lease.cancel_empty(self.owner) {
+                        drop(state);
+                        self.wait_render_capacity(&mut capacity_wait)?;
                         continue;
                     }
                     let reclaimed = firmware
                         .queues
                         .reclaim_unused_render_spare(Some(self.owner), true)?;
                     let ready = firmware.queues.has_render_ids(self.owner);
+                    // Every remaining QID belongs to an installed graph: take an
+                    // idle installed sibling, whose identities move with it.
+                    let forfeited = reclaimed.is_none()
+                        && !ready
+                        && firmware.queues.forfeit_idle_render_sibling(self.owner)?;
                     drop(state);
-                    if reclaimed.is_none() && !ready {
-                        return Err(error);
+                    if reclaimed.is_none() && !ready && !forfeited {
+                        self.wait_render_capacity(&mut capacity_wait)?;
+                        continue;
                     }
                     drop(reclaimed);
                 }
