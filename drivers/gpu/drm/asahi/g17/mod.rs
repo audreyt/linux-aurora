@@ -502,6 +502,8 @@ struct Firmware {
     registration_power_release_pending: bool,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
+    /// Render kick ring storage, kept and reused for the life of the device.
+    render_rings: Arc<kick::RenderRings>,
     render_ids: Arc<freelist::RenderIds>,
     init: initdata::InitData,
     _render_global: mmu::Vm,
@@ -1068,6 +1070,7 @@ impl Gpu {
                 registration_power_release_pending: false,
                 queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags),
                 pool: object::Pool::new()?,
+                render_rings: kick::RenderRings::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
                 init: initdata::InitData::new(),
                 _render_global: render_global,

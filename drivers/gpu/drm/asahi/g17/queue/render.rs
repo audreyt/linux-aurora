@@ -183,6 +183,7 @@ impl Pair {
     pub(crate) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
+        rings: &Arc<kick::RenderRings>,
         ids: [kick::Id; 2],
         slot: u8,
         owner: u64,
@@ -220,8 +221,9 @@ impl Pair {
         }
         let layout = target::Layout::new(pass, clusters)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
-        let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm())?;
-        let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm())?;
+        let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
+        let (fragment, fragment_alias) =
+            kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
         let (memory, aliases) = memory::Memory::new(
             alloc,
             pool,
@@ -235,7 +237,7 @@ impl Pair {
             word,
         )?;
         storage.write_init(kernel::try_init!(Self {
-            kick_aliases: Some([Some(ta_alias), Some(fragment_alias)]),
+            kick_aliases: Some([ta_alias, fragment_alias]),
             memory,
             kicks: [tiling, fragment],
             free_list,

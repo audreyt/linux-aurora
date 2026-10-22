@@ -16,6 +16,7 @@ use kernel::{prelude::*, sync::Arc};
 struct BuildResources {
     uat: Arc<crate::mmu::Uat>,
     objects: Arc<Pool>,
+    rings: Arc<crate::g17::kick::RenderRings>,
     ids: Arc<crate::g17::freelist::RenderIds>,
     global: crate::mmu::Vm,
     metrics: Arc<KernelObject>,
@@ -28,6 +29,7 @@ impl BuildResources {
         Ok(Self {
             uat: firmware.uat.clone(),
             objects: firmware.pool.clone(),
+            rings: firmware.render_rings.clone(),
             ids: firmware.render_ids.clone(),
             global: firmware._render_global.clone(),
             metrics: firmware._pm_metrics.clone(),
@@ -251,6 +253,7 @@ impl super::super::Backend {
             Pair::new(
                 &alloc,
                 &resources.objects,
+                &resources.rings,
                 reservation.ids,
                 slot,
                 self.owner,

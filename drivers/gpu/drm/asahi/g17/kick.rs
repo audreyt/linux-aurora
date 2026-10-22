@@ -6,8 +6,15 @@
 //! and their ring backing stay owned until both firmware processors stop;
 //! command completion alone does not detach a hardware queue.
 
-use core::sync::atomic::{fence, Ordering};
-use kernel::prelude::*;
+use core::{
+    mem::ManuallyDrop,
+    sync::atomic::{fence, Ordering},
+};
+use kernel::{
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
 
 use super::{
     fw::{kick::*, queue::DataMaster},
@@ -271,10 +278,94 @@ enum Backing {
         high: mmu::KernelMapping,
         low: KernelObject,
     },
-    Render {
-        low: mmu::KernelMapping,
-        high: KernelObject,
-    },
+    Render(RenderRing),
+}
+
+/// A render ring's pages and the shared lower reservation clients alias.
+struct RenderStorage {
+    // The lower alias drops before its backing.
+    low: mmu::KernelMapping,
+    high: KernelObject,
+}
+
+/// Render ring storage outlives its rings for the life of the device.
+///
+/// A client VM keeps each render ring alias it installs until the VM closes,
+/// while an installed pair whose identities were never published can be
+/// reclaimed and its rings dropped. Freeing that storage would hand its shared
+/// lower address to another ring; a client still aliasing the old pages there
+/// that later receives the new ring could not alias it (`prepare_client_alias`
+/// fails with EFAULT). Retired storage is therefore kept and reused by later
+/// rings: an address keeps naming the same pages, so every alias stays valid.
+#[pin_data]
+pub(crate) struct RenderRings {
+    #[pin]
+    stock: Mutex<RingStock>,
+}
+
+struct RingStock {
+    /// Retired storage; `true` marks storage of a ring that never wrote an
+    /// entry, which a later ring may reuse. Written rings stay retired.
+    retired: KVec<(bool, RenderStorage)>,
+    /// Storage created so far; `retired` keeps capacity for all of it, so a
+    /// dropped ring always returns its storage without allocating.
+    created: usize,
+}
+
+impl RenderRings {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                stock <- new_mutex!(
+                    RingStock { retired: KVec::new(), created: 0 },
+                    "G17 render kick rings"
+                ),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    fn take(&self) -> Option<RenderStorage> {
+        let mut stock = self.stock.lock();
+        let index = stock.retired.iter().rposition(|(reusable, _)| *reusable)?;
+        let last = stock.retired.len() - 1;
+        stock.retired.swap(index, last);
+        stock.retired.pop().map(|(_, storage)| storage)
+    }
+
+    /// Reserves the return of one more, just created storage.
+    fn admit(&self) -> Result {
+        let mut stock = self.stock.lock();
+        let created = stock.created.checked_add(1).ok_or(EOVERFLOW)?;
+        let additional = created.saturating_sub(stock.retired.len());
+        stock.retired.reserve(additional, GFP_KERNEL)?;
+        stock.created = created;
+        Ok(())
+    }
+
+    fn put(&self, storage: RenderStorage, reusable: bool) {
+        let mut stock = self.stock.lock();
+        if let Err(rejected) = stock.retired.push_within_capacity((reusable, storage)) {
+            // `admit` reserved room for every created storage. Never free it.
+            core::mem::forget(rejected);
+        }
+    }
+}
+
+/// Storage lent to one render ring; returned to the stock when the ring drops.
+struct RenderRing {
+    storage: ManuallyDrop<RenderStorage>,
+    rings: Arc<RenderRings>,
+    /// Set once an entry was written: such storage is never reused.
+    written: bool,
+}
+
+impl Drop for RenderRing {
+    fn drop(&mut self) {
+        // SAFETY: `storage` is taken exactly once, here, and not used afterwards.
+        let storage = unsafe { ManuallyDrop::take(&mut self.storage) };
+        self.rings.put(storage, !self.written);
+    }
 }
 
 /// An installed queue's permanent ring. Client aliases are held by the bound
@@ -310,6 +401,9 @@ impl PreparedKick<'_> {
         // the new entry starts before the outer command is published.
         unsafe { self.destination.write_unaligned(self.entry) };
         fence(Ordering::SeqCst);
+        if let Backing::Render(ring) = &mut self.queue.backing {
+            ring.written = true;
+        }
         self.queue.previous = Some(self.timestamp);
         self.queue.timestamp = self.timestamp.next();
         self.timestamp
@@ -344,13 +438,44 @@ impl Queue {
         })
     }
 
+    /// Retired storage of a never-written ring is reused first. Its address
+    /// names the same pages in every client that aliases it, so an existing
+    /// alias in `client` is kept (None) and a missing one is created.
     pub(crate) fn render(
         alloc: &Allocator<'_>,
         id: Id,
         client: &mmu::Vm,
-    ) -> Result<(Self, mmu::KernelMapping)> {
+        rings: &Arc<RenderRings>,
+    ) -> Result<(Self, Option<mmu::KernelMapping>)> {
         if id.engine == DataMaster::Compute {
             return Err(EINVAL);
+        }
+        if let Some(storage) = rings.take() {
+            let mut ring = RenderRing {
+                storage: ManuallyDrop::new(storage),
+                rings: rings.clone(),
+                written: false,
+            };
+            // A fresh ring is zeroed; no firmware ever read this one.
+            ring.storage.high.bytes_mut().fill(0);
+            fence(Ordering::SeqCst);
+            let address = ring.storage.low.iova();
+            let alias =
+                ring.storage
+                    .high
+                    .prepare_alias(client, address, mmu::PROT_GPU_SHARED_RW, true);
+            // On failure the storage returns to the stock and a fresh ring is built.
+            if let Ok(alias) = alias {
+                return Ok((
+                    Self {
+                        backing: Backing::Render(ring),
+                        id,
+                        timestamp: KickTimestamp::FIRST,
+                        previous: None,
+                    },
+                    alias,
+                ));
+            }
         }
         let high = alloc.kernel(
             KICK_RING_SIZE,
@@ -390,14 +515,26 @@ impl Queue {
                 Err(error) => return Err(error),
             }
         };
+        let storage = RenderStorage { low, high };
+        // Count the storage only once it exists. Without room to return it,
+        // nothing has aliased it but `client`, which drops first.
+        if let Err(error) = rings.admit() {
+            drop(client);
+            drop(storage);
+            return Err(error);
+        }
         Ok((
             Self {
-                backing: Backing::Render { low, high },
+                backing: Backing::Render(RenderRing {
+                    storage: ManuallyDrop::new(storage),
+                    rings: rings.clone(),
+                    written: false,
+                }),
                 id,
                 timestamp: KickTimestamp::FIRST,
                 previous: None,
             },
-            client,
+            Some(client),
         ))
     }
 
@@ -407,19 +544,19 @@ impl Queue {
     pub(crate) fn low_va(&self) -> u64 {
         match &self.backing {
             Backing::Compute { low, .. } => low.gpu_va(),
-            Backing::Render { low, .. } => low.iova(),
+            Backing::Render(ring) => ring.storage.low.iova(),
         }
     }
     pub(crate) fn firmware_va(&self) -> u64 {
         match &self.backing {
             Backing::Compute { high, .. } => high.iova(),
-            Backing::Render { high, .. } => high.gpu_va(),
+            Backing::Render(ring) => ring.storage.high.gpu_va(),
         }
     }
     fn object(&mut self) -> &mut KernelObject {
         match &mut self.backing {
             Backing::Compute { low, .. } => low,
-            Backing::Render { high, .. } => high,
+            Backing::Render(ring) => &mut ring.storage.high,
         }
     }
     pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
@@ -432,7 +569,7 @@ impl Queue {
     pub(crate) fn prepare_client_alias(&self, vm: &mmu::Vm) -> Result<Option<mmu::KernelMapping>> {
         let object = match &self.backing {
             Backing::Compute { low, .. } => low,
-            Backing::Render { high, .. } => high,
+            Backing::Render(ring) => &ring.storage.high,
         };
         object.prepare_alias(vm, self.low_va(), mmu::PROT_GPU_SHARED_RW, true)
     }
