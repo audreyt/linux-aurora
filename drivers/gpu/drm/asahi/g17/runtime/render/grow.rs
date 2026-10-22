@@ -228,6 +228,8 @@ impl crate::g17::Shared {
                             .is_some_and(|pair| pair.published_in_flight());
                         entry.borrowed_dependencies =
                             entry.pair.as_ref().map(|pair| pair.dependency_snapshot());
+                        entry.borrowed_switch =
+                            entry.pair.as_ref().and_then(|pair| pair.switch_in_flight());
                         entry.growing = true;
                         Some(entry.pair.take().ok_or(EIO)?)
                     }
@@ -269,6 +271,7 @@ impl crate::g17::Shared {
                 }
                 entry.pair = pair.take();
                 entry.borrowed_dependencies = None;
+                entry.borrowed_switch = None;
                 entry.growing = false;
             }
             if firmware.queues.render.grow.active != Some(request) {

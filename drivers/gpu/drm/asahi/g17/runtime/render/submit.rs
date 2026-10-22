@@ -395,6 +395,14 @@ impl crate::g17::Firmware {
         }
         let dependencies = self.queues.render_dependencies(owner, packet, state)?;
         let pair = self.queues.render.entry(slot)?.pair.as_ref().ok_or(EIO)?;
+        // An owner change taken from a live owner which closed meanwhile: its
+        // first command waits until that scheduler's release has been consumed.
+        if pair
+            .owner_switch_from(&packet.context)
+            .is_some_and(|scheduler| self.queues.teardown.releasing_scheduler(scheduler))
+        {
+            return Err(EBUSY);
+        }
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
         let (buffer_id, buffer_token) = self.queues.buffers.acquire_owner(buffer_id)?;

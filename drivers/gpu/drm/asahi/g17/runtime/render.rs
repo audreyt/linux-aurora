@@ -46,6 +46,9 @@ struct Entry {
     pending_owner_closed: bool,
     borrowed_active: bool,
     borrowed_dependencies: Option<crate::g17::queue::render::Dependencies>,
+    /// `Pair::switch_in_flight` of a borrowed pair. A borrowed pair publishes
+    /// nothing, so the snapshot can only be stale towards an older switch.
+    borrowed_switch: Option<u64>,
     event_masks: [u64; 2],
     closed: bool,
     pending_error: Option<(Arc<crate::g17::status::VmStatus>, Error)>,
@@ -163,6 +166,7 @@ impl RenderState {
         }
         entry.borrowed_active = pair.published_in_flight();
         entry.borrowed_dependencies = Some(pair.dependency_snapshot());
+        entry.borrowed_switch = pair.switch_in_flight();
         entry.preparing = Some(packet.clone());
         entry.pair.take().ok_or(EIO)
     }
@@ -182,6 +186,7 @@ impl RenderState {
         }
         entry.pair = pair.take();
         entry.borrowed_dependencies = None;
+        entry.borrowed_switch = None;
         entry.preparing = None;
         Ok(())
     }
@@ -401,6 +406,7 @@ impl Registry {
                 pending_owner_closed: false,
                 borrowed_active: false,
                 borrowed_dependencies: None,
+                borrowed_switch: None,
                 event_masks: [0; 2],
                 closed: false,
                 pending_error: None,

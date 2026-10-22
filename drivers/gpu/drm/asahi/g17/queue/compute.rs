@@ -566,6 +566,21 @@ impl Queue {
     pub(crate) fn context(&self) -> Option<&Arc<Context>> {
         self.binding.as_ref().map(|binding| &binding.context)
     }
+    /// The first command after an owner change away from `context` has been
+    /// published and not retired: the queue still runs that scheduler's state.
+    pub(crate) fn switching_from(&self, context: &Arc<Context>) -> bool {
+        self.previous.as_ref().is_some_and(|previous| {
+            previous.publication.is_some() && Arc::ptr_eq(&previous.context, context)
+        })
+    }
+    /// The context these queue records were bound to before an owner change
+    /// whose first command is not published yet.
+    pub(crate) fn pending_switch_from(&self) -> Option<&Arc<Context>> {
+        self.previous
+            .as_ref()
+            .filter(|previous| previous.publication.is_none())
+            .map(|previous| &previous.context)
+    }
     /// Quarantined commands still retain the scheduler until their retirement witness.
     pub(crate) fn idle_for_context(&self, context: &Arc<Context>) -> bool {
         !self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))

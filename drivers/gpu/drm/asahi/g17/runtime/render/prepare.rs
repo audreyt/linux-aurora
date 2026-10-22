@@ -133,6 +133,13 @@ impl super::super::Backend {
                         if !pair.reusable()? {
                             return Err(EBUSY);
                         }
+                        // The release of the pair's scheduler is armed or still being
+                        // consumed: the firmware may process it against these queues.
+                        // The teardown parks the pair once the release is witnessed;
+                        // the new owner then installs it with fresh queue records.
+                        if firmware.queues.teardown.releasing(pair.context()) {
+                            return Err(EBUSY);
+                        }
                         let foreign = !Arc::ptr_eq(pair.context().status(), self.context.status());
                         if foreign {
                             firmware
@@ -164,6 +171,8 @@ impl super::super::Backend {
                             .is_some_and(|pair| pair.published_in_flight());
                         entry.borrowed_dependencies =
                             entry.pair.as_ref().map(|pair| pair.dependency_snapshot());
+                        entry.borrowed_switch =
+                            entry.pair.as_ref().and_then(|pair| pair.switch_in_flight());
                         Build::Rebind {
                             pair: entry.pair.take().ok_or(EIO)?,
                             buffer,
@@ -466,6 +475,10 @@ impl super::super::Backend {
                 // A pair forfeited by a live owner still names that owner's
                 // scheduler; only its logical close may arm the release.
                 let owner_closed = entry.closed;
+                // That owner may have closed while this binding was prepared.
+                if firmware.queues.teardown.releasing(pair.context()) {
+                    return Err(EBUSY);
+                }
                 if firmware.queues.render.retired.len()
                     == firmware.queues.render.retired.capacity()
                 {
@@ -502,6 +515,7 @@ impl super::super::Backend {
             entry.pending_owner_closed = false;
             entry.pair = Some(pair);
             entry.borrowed_dependencies = None;
+            entry.borrowed_switch = None;
             (result, firmware.render_grow_ready())
         };
         drop(prepared);

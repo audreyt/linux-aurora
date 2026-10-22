@@ -31,6 +31,11 @@ pub(crate) struct ParkedPair {
     registered: Option<u8>,
     outer_started: u8,
     previous: Option<RetiredBinding>,
+    /// Scheduler page these queues last ran a command for. A pair parked
+    /// without a consumed release (an unused warm pair taken for another
+    /// owner) keeps it, so its next owner change still waits while that
+    /// scheduler is released.
+    executed: u64,
 }
 
 /// All new graph ownership stays separate from the installed kick storage until commit.
@@ -91,6 +96,7 @@ impl Pair {
             registered: self.registered,
             outer_started: self.outer_started,
             previous: self.previous,
+            executed: self.executed,
         };
         let retired = RetiredBinding {
             memory: Some(self.memory),
@@ -105,6 +111,13 @@ impl Pair {
 }
 
 impl ParkedPair {
+    /// The release of `scheduler` has been consumed: a later owner change no
+    /// longer has to wait for it.
+    pub(crate) fn release_consumed(&mut self, scheduler: u64) {
+        if self.executed == scheduler {
+            self.executed = 0;
+        }
+    }
     pub(crate) fn qids(&self) -> [u8; 2] {
         self.ids.map(kick::Id::qid)
     }
@@ -225,6 +238,8 @@ impl ParkedPair {
             displaced: None,
             replay: None,
             context_update: true,
+            executed: self.executed,
+            switch: None,
         }))
     }
 }
