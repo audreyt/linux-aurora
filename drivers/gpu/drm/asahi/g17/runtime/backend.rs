@@ -147,7 +147,13 @@ impl job::Backend for Backend {
     }
 
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status {
-        self.release_backlog(&packet);
+        // A packet still in publication keeps its place in the backlog: its
+        // publisher waits on, and a later dependency-free command must not be
+        // published from its ioctl ahead of it. Publication, cancellation and
+        // job drop release it.
+        if packet.is_published() {
+            self.release_backlog(&packet);
+        }
         let result = match packet.engine() {
             Engine::Compute => self.timeout_compute(&packet),
             Engine::Render => self.timeout_render(&packet),

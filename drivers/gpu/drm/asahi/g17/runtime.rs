@@ -1497,9 +1497,16 @@ impl super::Firmware {
         if self.render_control_backpressured() {
             return Ok(None);
         }
+        // While the shared lower window refuses free-list backing, no idle
+        // retained compute pool stays warm: render and new compute need it more.
+        let cap = if super::freelist::lower_pressure() {
+            0
+        } else {
+            COMPUTE_WARM_CAP
+        };
         let (published, next) = self.queues.vacate_idle_pools(
             &self.init,
-            COMPUTE_WARM_CAP,
+            cap,
             now,
             COMPUTE_WARM_EXPIRY_NS,
         )?;

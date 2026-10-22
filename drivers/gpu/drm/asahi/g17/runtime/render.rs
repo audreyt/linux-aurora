@@ -388,11 +388,27 @@ impl Registry {
             .iter()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
-            .fold([0usize; 2], |[all, bound], queue| {
-                [all + 1, bound + usize::from(queue.owner().is_some())]
+            .fold([0usize; 3], |[all, bound, bytes], queue| {
+                [all + 1, bound + usize::from(queue.owner().is_some()), bytes + queue.pool_bytes()]
             });
+        // Render pools reachable from installed or prepared entries, each once.
+        let mut pools = [0usize; 3];
+        for (index, entry) in self.render.entries.iter().enumerate() {
+            let Some(pool) = entry.as_ref().and_then(|entry| entry.pool.as_ref()) else {
+                continue;
+            };
+            let first = !self.render.entries[..index].iter().flatten().any(|other| {
+                other.pool.as_ref().is_some_and(|other| Arc::ptr_eq(other, pool))
+            });
+            if first {
+                let bytes = pool.backing_bytes();
+                pools[0] += 1;
+                pools[1] += bytes;
+                pools[2] = pools[2].max(bytes);
+            }
+        }
         pr_warn!(
-            "asahi: G17 render capacity {}: queues={} slots owned={} released={} held={} quarantined={}; entries={} pairs={} parked={} building={} preparing={} closed={}; retired={}/{}; teardown open={} draining={} releasing={}; qids leased={} pair={} compute={}; compute queues={} bound={}; pb ids={}; metrics={}/{}; render pools={}\n",
+            "asahi: G17 render capacity {}: queues={} slots owned={} released={} held={} quarantined={}; entries={} pairs={} parked={} building={} preparing={} closed={}; retired={}/{}; teardown open={} draining={} releasing={}; qids leased={} pair={} compute={}; compute queues={} bound={} pools={} MiB; pb ids={}; metrics={}/{}; render pools={} (with entries {} totalling {} MiB, largest {} MiB)\n",
             reason,
             self.admission.queues(),
             owned,
@@ -415,10 +431,14 @@ impl Registry {
             compute_ids,
             compute[0],
             compute[1],
+            compute[2] >> 20,
             self.buffers.in_use(),
             metrics,
             metric_slots,
             render_pools,
+            pools[0],
+            pools[1] >> 20,
+            pools[2] >> 20,
         );
     }
 

@@ -377,6 +377,63 @@ fn main(){
     subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021',str(fixture),'-o',str(root/'compute-takeover-controls')],check=True)
     subprocess.run([str(root/'compute-takeover-controls')],check=True)
 
+def lower_window_gate_tests(root, source):
+    s=(source/'g17/freelist.rs').read_text()
+    start=s.index('static LOWER_FREED');end=s.index('pub(crate) struct Pages {')
+    gate=s[start:end]
+    fixture=root/'lower-window-gate-controls.rs'
+    fixture.write_text('''#![allow(dead_code)]
+use std::sync::atomic::{AtomicU64, Ordering};
+type Result<T=()> = std::result::Result<T,i32>;
+const ENOSPC:i32=-28;const ENOMEM:i32=-12;
+static CLOCK: AtomicU64 = AtomicU64::new(1_000_000_000);
+fn now_ns()->u64 {CLOCK.load(Ordering::Relaxed)}
+mod freelist {
+use super::*;
+'''+gate+'''
+pub(crate) fn freed() {LOWER_FREED.fetch_add(1, Ordering::AcqRel);}
+pub(crate) fn place<T>(size: usize, f: impl FnOnce() -> Result<T>) -> Result<T> {place_lower(size, f)}
+}
+use freelist::*;
+fn attempt(size:usize, result:Result<u32>, calls:&mut u32)->Result<u32> {place(size,||{*calls+=1;result})}
+fn main(){
+ let mut calls=0;
+ assert_eq!(attempt(100,Ok(1),&mut calls),Ok(1));assert_eq!(calls,1);assert!(!lower_pressure());
+ assert_eq!(attempt(100,Err(ENOSPC),&mut calls),Err(ENOSPC));assert_eq!(calls,2);assert!(lower_pressure());
+ for _ in 0..1000 {assert_eq!(attempt(100,Ok(1),&mut calls),Err(ENOSPC));}
+ assert_eq!(attempt(200,Ok(1),&mut calls),Err(ENOSPC));
+ assert_eq!(calls,2,"a refused size is not placed again while nothing was freed");
+ assert_eq!(attempt(50,Err(ENOSPC),&mut calls),Err(ENOSPC));assert_eq!(calls,3,"a smaller size still probes");
+ assert_eq!(attempt(60,Ok(1),&mut calls),Err(ENOSPC));assert_eq!(calls,3,"the smaller refusal now gates larger sizes");
+ freed();assert!(!lower_pressure());
+ assert_eq!(attempt(100,Err(ENOSPC),&mut calls),Err(ENOSPC));assert_eq!(calls,4,"freed backing lets a waiter retry");
+ // One probe per interval across all callers, then the gate closes again.
+ CLOCK.fetch_add(100_000_000,Ordering::Relaxed);
+ assert_eq!(attempt(100,Err(ENOSPC),&mut calls),Err(ENOSPC));assert_eq!(calls,5);
+ assert_eq!(attempt(100,Ok(1),&mut calls),Err(ENOSPC));assert_eq!(calls,5);
+ CLOCK.fetch_add(100_000_000,Ordering::Relaxed);
+ assert_eq!(attempt(100,Ok(7),&mut calls),Ok(7));assert_eq!(calls,6);assert!(!lower_pressure(),"a fitting placement clears pressure");
+ assert_eq!(attempt(100,Err(ENOMEM),&mut calls),Err(ENOMEM));assert!(!lower_pressure(),"only window refusals gate");
+ println!("lower window: refused free-list placements are not repeated until backing is freed or one probe per 100 ms");
+}
+''')
+    subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021',str(fixture),'-o',str(root/'lower-window-gate-controls')],check=True)
+    subprocess.run([str(root/'lower-window-gate-controls')],check=True)
+
+def watchdog_publication_guard_tests(source):
+    # A packet still in publication (capacity or graph waits) must never reach
+    # pair lookups or a collector allocation from its watchdog: either error
+    # stops the runtime for every client.
+    for path, name in [('g17/runtime/render/settle.rs', 'pub(in crate::g17) fn timeout_render('),
+                       ('g17/runtime/compute_control.rs', 'pub(super) fn timeout_compute(')]:
+        text = (source / path).read_text()
+        at = text.index(name)
+        body = text[at:text.index('\n    }\n', at)]
+        guard = body.index('if !packet.is_published() {\n            return Ok(());')
+        collector = body.index('let Ok(mut deferred) = DeferredBatch::worker() else {')
+        assert guard < collector and 'DeferredBatch::worker()?' not in body, name
+    print('watchdog: unpublished packets and collector allocation failure never stop the runtime')
+
 def shared_alias_tests(root, source):
     s=(source/'g17/object.rs').read_text()
     at=s.index('    pub(crate) fn lower_with_aliases(');begin=s.index('{',at);end=begin+1;depth=1
@@ -1057,4 +1114,6 @@ if __name__ == '__main__':
         queue_tests(Path(temporary), DRIVER)
         compute_takeover_tests(Path(temporary), DRIVER)
         compute_admission_tests(Path(temporary), DRIVER)
+        lower_window_gate_tests(Path(temporary), DRIVER)
+        watchdog_publication_guard_tests(DRIVER)
         shared_alias_tests(Path(temporary), DRIVER)

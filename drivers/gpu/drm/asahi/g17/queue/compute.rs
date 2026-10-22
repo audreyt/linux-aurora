@@ -1213,6 +1213,10 @@ impl Queue {
     pub(crate) fn last_end(&self) -> u64 {
         self.last_end
     }
+    /// Bytes of USC pool backing in the shared lower window, for diagnostics.
+    pub(crate) fn pool_bytes(&self) -> usize {
+        self.pool.backing_bytes()
+    }
     /// The last owner's file and VM are gone: its execution root was released
     /// after the scheduler-state release and command retirement were witnessed
     /// (`Context::release_execution`), and this queue is idle without an owner.
