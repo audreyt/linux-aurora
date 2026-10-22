@@ -27,7 +27,12 @@ use kernel::{
     xarray,
 };
 
-const EARLY_DEPTH: usize = 2;
+/// Commands of one engine (render, compute) still in flight below which a
+/// dependency-free command is published from its ioctl rather than from the
+/// scheduler's worker, whose hop costs ~100 us per command on Neo. Compute
+/// streams of three or four dispatches publish inline; renders keep the
+/// shallow limit.
+const EARLY_DEPTH: [usize; 2] = [2, 4];
 static FENCE_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
 pub(crate) mod admission;
@@ -281,7 +286,7 @@ impl<B: Backend> Queue<B> {
             }
         }
         let early = dependencies.is_empty()
-            && self.frontiers[index].len() < EARLY_DEPTH;
+            && self.frontiers[index].len() < EARLY_DEPTH[index];
         let packet = Packet::new(
             id,
             self.context.clone(),
