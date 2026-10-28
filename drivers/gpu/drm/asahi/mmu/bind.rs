@@ -83,7 +83,10 @@ impl Vm {
         crate::gem::held_sg_table(gem, dev)?;
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData {
+                newest_bind: AtomicU64::new(0),
+                segments <- new_mutex!(None),
+            }))?;
         {
             let mut segments = vm_bo.data().segments.lock();
             if segments.is_none() {
@@ -156,13 +159,18 @@ impl Vm {
                                 flags,
                             });
                             let retired = result.is_ok().then(|| {
-                                let retired = self.commit_context_binding(&map.gem, &map.context);
+                                let retired = self.commit_context_binding(
+                                    &map.gem,
+                                    &map.context,
+                                    ctx.bind_sequence,
+                                );
                                 self.track_shared_binding(
                                     &map.gem,
                                     map.addr,
                                     map.size,
                                     map.offset,
                                     map.single_page,
+                                    ctx.bind_sequence,
                                 );
                                 retired
                             });

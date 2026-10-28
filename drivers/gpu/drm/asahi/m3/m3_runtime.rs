@@ -169,9 +169,15 @@ impl Inner {
     }
 }
 impl Inner {
-    /// Fail every packet that was never published. Their fences signal with the error.
+    /// Fail every packet not yet fully published. Their fences signal with the error. One that no
+    /// batch ever included releases its VM job guard first, so its VM isn't quarantined for work
+    /// the firmware never saw. One that may have been published keeps it: a partly published
+    /// packet, or one whose batch `fail_active` has already drained from `active`.
     fn fail_pending(&mut self, error: Error) {
-        for (packet,_) in self.pending.drain_all() {packet.finish(Err(error));}
+        for (packet,_) in self.pending.drain_all() {
+            if policy::release_unpublished(packet.may_be_published()) {packet.release_guard();}
+            packet.finish(Err(error));
+        }
     }
     /// A published batch failed or never retired: latch the fault, log it, and fail its
     /// packets. The packets stay retained (with their VM job guards) until teardown, because
@@ -374,6 +380,9 @@ impl Inner {
         for (p,_) in entries {
             if !self.packets.iter().any(|q| Arc::ptr_eq(q,p)) {self.packets.push(p.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
         }
+        // Before any producer state changes: an append the overlapping firmware consumes, or a
+        // partial publication, makes these packets visible to it.
+        for (p,_) in entries {p.mark_published();}
         let found=self.jobs.iter().position(|job| matches!((job,control),
             (NativeJob::Compute(_),crate::m3::m3_submit::Command::Compute(_)) |
             (NativeJob::Render(_),crate::m3::m3_submit::Command::Render{..})));
@@ -519,6 +528,7 @@ impl Inner {
         // Keep the packet before any producer mutation. No other batch is live.
         self.packets.clear();
         self.packets.push(packet.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        packet.mark_published();
         let mut render_prepared=false;
         let mut compute_prepared=false;
         let prepared=(||->Result<usize> {
@@ -974,6 +984,26 @@ impl Inner {
 // Registration and Mutex initialization otherwise duplicates it on the bounded
 // kernel stack. ManuallyDrop retains the whole allocation on failed ASC stop.
 pub(crate) struct Runtime { inner: ManuallyDrop<KBox<Inner>> }
+/// Claimed before this boot's first ASC start.
+static FIRMWARE_START: policy::StartLatch = policy::StartLatch::new();
+/// Takes a module reference, unless the module is already being removed.
+#[cfg(CONFIG_MODULE_UNLOAD)]
+fn pin_module() -> bool {
+    // SAFETY: THIS_MODULE is this module, whose code is running; try_module_get fails once
+    // removal has begun instead of reviving the reference count.
+    unsafe { kernel::bindings::try_module_get(crate::THIS_MODULE.as_ptr()) }
+}
+/// Without module unloading there is no removal to race.
+#[cfg(not(CONFIG_MODULE_UNLOAD))]
+fn pin_module() -> bool { true }
+/// Drops a reference [`pin_module`] took.
+#[cfg(CONFIG_MODULE_UNLOAD)]
+fn unpin_module() {
+    // SAFETY: called only to drop a reference pin_module took.
+    unsafe { kernel::bindings::module_put(crate::THIS_MODULE.as_ptr()) };
+}
+#[cfg(not(CONFIG_MODULE_UNLOAD))]
+fn unpin_module() {}
 impl Runtime {
     #[inline(never)]
     pub(crate) fn new(pdev: &platform::Device<Core<'_>>, drm: &driver::AsahiDrmDevice, device: Device, contents: crate::m3::m3_adt_config::Contents) -> Result<Self> {
@@ -994,6 +1024,22 @@ impl Runtime {
         let mut transport = rtkit::RtKit::new(pdev.as_ref(), None, 0, state.clone()).inspect_err(coproc_refused)?;
         if crate::m3::m3_adt_config::stop_before_asc(pdev.as_ref()) {
             return Err(ENODEV);
+        }
+        // A second start (unbind and rebind, a module reload, a retry after a failed start)
+        // would set RUN while TTBAT context 0 still names the freed root of this one. An ordinary
+        // (not forced) unload is blocked once the latch is claimed, so a reload can't forget it.
+        // The pin comes first: a later probe can race an ordinary rmmod, and once removal has
+        // begun nothing starts.
+        match policy::claim_start(&FIRMWARE_START, pin_module, unpin_module) {
+            Ok(()) => {}
+            Err(policy::StartRefusal::Removing) => {
+                dev_err!(pdev.as_ref(), "M3: the module is being removed; GPU not started\n");
+                return Err(ENODEV);
+            }
+            Err(policy::StartRefusal::AlreadyStarted) => {
+                dev_err!(pdev.as_ref(), "M3: the GPU firmware already started once this boot and can't start again; reboot to start the GPU\n");
+                return Err(EBUSY);
+            }
         }
         // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
         let mut started=false;

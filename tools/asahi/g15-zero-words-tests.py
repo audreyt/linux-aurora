@@ -7,7 +7,9 @@ No GPU, firmware file, private fixture, kernel build or hardware access. The
 golden T6030 inputs below are from SiliconForest 9f09c85f8d3b, except the full
 hw.rs file refreshed at 709f0f08316a for the reviewed shared PB allocator changes
 and again when the initial PB posting became a module parameter (the tuning
-constant PB_BLOCKS removed). Its T6030 configuration module is independently
+constant PB_BLOCKS removed), and when the T6030/T6031 tables were gated on
+CONFIG_DRM_ASAHI_G15 for the T8122 runtime's UAT adoption (two #[cfg] lines;
+the tables are unchanged). Its T6030 configuration module is independently
 pinned to the original bytes.
 """
 
@@ -24,7 +26,7 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "658c58026553c098b899aeffa0b6ae5be2b14921aef19df9e4f14789b7b890c4",
+    "hw.rs": "aa043d11bad177a0aa38755d14159786ee3313c4f8432f5ed56d6967882d9f01",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {

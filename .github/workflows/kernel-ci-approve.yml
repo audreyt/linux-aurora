@@ -1,0 +1,48 @@
+# GitHub holds every pull request run from outside collaborators until a
+# maintainer approves it. This releases the kernel CI run of a pull request
+# whose author is vouched for in .github/VOUCHED.td, so the team's outside
+# collaborators build like everyone else on the team. Anyone else's run stays
+# held for a maintainer. tools/aurora-ci/README.rst, "Who can start a build".
+
+name: Kernel CI (approve vouched authors)
+
+on:
+  # pull_request_target runs the target branch's workflow, and this job only
+  # fetches the target branch's files: no pull request code ever runs here,
+  # with or without the write token.
+  pull_request_target: # zizmor: ignore[dangerous-triggers] no checkout; target-branch code only
+    branches: [integration/aurora]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: kernel-ci-approve-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  approve:
+    name: approve
+    # Organization members' and collaborators' runs are never held.
+    if: ${{ !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write # approve the held kernel CI run
+      contents: read # read the target branch's tools and vouch list
+      pull-requests: read # recheck the pull request's head before approving
+    steps:
+      # github.sha is the target branch's tip on pull_request_target.
+      - name: Fetch the target branch's tools and vouch list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools"
+          for file in tools/aurora-ci/plan.py tools/aurora-ci/approve-runs.py .github/VOUCHED.td; do
+            gh api -H "Accept: application/vnd.github.raw+json" \
+              "repos/$GITHUB_REPOSITORY/contents/$file?ref=$GITHUB_SHA" > "$RUNNER_TEMP/tools/${file##*/}"
+          done
+      - name: Approve the run of a vouched author
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I "$RUNNER_TEMP/tools/approve-runs.py" --vouched "$RUNNER_TEMP/tools/VOUCHED.td"

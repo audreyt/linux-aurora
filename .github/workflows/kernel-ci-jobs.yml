@@ -61,9 +61,28 @@ jobs:
           persist-credentials: false
           filter: blob:none
           sparse-checkout: tools/aurora-ci
+      # From the target branch's tip, never the pull request: a pull request
+      # must not vouch for its own author. Not pull_request.base.sha, which
+      # stays at the base the pull request was opened against. Without the
+      # list (the API fails) no author is trusted.
+      - name: Read the vouch list from the target branch
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if ! gh api -H "Accept: application/vnd.github.raw+json" \
+              "repos/$GITHUB_REPOSITORY/contents/.github/VOUCHED.td?ref=refs/heads/$BASE_REF" \
+              > "$RUNNER_TEMP/VOUCHED.td"; then
+            : > "$RUNNER_TEMP/VOUCHED.td"
+            echo "::warning title=Vouch list::no .github/VOUCHED.td on $BASE_REF; no author is trusted"
+          fi
       - name: Plan the run
         id: plan
-        run: python3 -I tools/aurora-ci/plan.py --label "$BUILD_LABEL"
+        run: |
+          vouched=()
+          [[ -f $RUNNER_TEMP/VOUCHED.td ]] && vouched=(--vouched "$RUNNER_TEMP/VOUCHED.td")
+          python3 -I tools/aurora-ci/plan.py --label "$BUILD_LABEL" "${vouched[@]}"
       # Only trees are needed: the build key is made of tree hashes.
       - name: Fetch the packaging inputs
         if: steps.plan.outputs.tier == 'full'

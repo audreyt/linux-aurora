@@ -26,13 +26,11 @@ bool asahi_g15_board(void);
 bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_release_power(struct device *dev);
-void asahi_g15_module_get(void);
+bool asahi_g15_module_try_get(void);
+void asahi_g15_module_put(void);
 void asahi_g15_reprobe(void);
 void asahi_g15_report_loader_gpu(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
-bool asahi_g15_ram_disjoint(u64 start, u64 size);
-bool asahi_g15_ram_within(u64 start, u64 size);
-unsigned int asahi_g15_memory_mode(u64 start, u64 size);
 void __iomem *asahi_g15_ioremap_wc(u64 start, size_t size);
 bool asahi_g15_dma_coherent(struct device *dev);
 int asahi_g15_pmp_prepare(struct device *dev);
@@ -88,20 +86,31 @@ void asahi_g15_report_loader_gpu(void)
  */
 bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size)
 {
-	static const char *const paths[] = {
-		"/reserved-memory/uat-ttbs",
-		"/reserved-memory/uat-pagetables",
-		"/reserved-memory/uat-handoff",
-		"/reserved-memory/uat-pagetables-l2",
+	static const char *const names[] = {
+		"uat-ttbs",
+		"uat-pagetables",
+		"uat-handoff",
+		"uat-pagetables-l2",
 	};
-	struct device_node *np;
+	struct device_node *rmem, *child, *np = NULL;
 	struct resource res;
+	unsigned int count = 0;
 	bool match;
 
-	if (index >= ARRAY_SIZE(paths))
+	if (index >= ARRAY_SIZE(names))
 		return false;
-	np = of_find_node_by_path(paths[index]);
-	match = np && of_device_is_available(np) &&
+
+	/* Unit addresses belong to the DT layout, not the reservation name. */
+	rmem = of_find_node_by_path("/reserved-memory");
+	for_each_child_of_node(rmem, child) {
+		if (!of_node_name_eq(child, names[index]))
+			continue;
+		count++;
+		if (!np)
+			np = of_node_get(child);
+	}
+	of_node_put(rmem);
+	match = count == 1 && np && of_device_is_available(np) &&
 		!of_property_read_bool(np, "reusable") &&
 		!of_get_address(np, 1, NULL, NULL) &&
 		!of_address_to_resource(np, 0, &res) &&
@@ -201,10 +210,20 @@ void asahi_g15_release_power(struct device *dev)
 
 }
 
-/* Pin this module until reboot. */
-void asahi_g15_module_get(void)
+/*
+ * Pin this module until reboot, unless its removal has begun: a deferred or
+ * asynchronous probe can run after an ordinary rmmod has passed its reference
+ * check, which __module_get() would not stop.
+ */
+bool asahi_g15_module_try_get(void)
 {
-	__module_get(THIS_MODULE);
+	return try_module_get(THIS_MODULE);
+}
+
+/* Drop a reference asahi_g15_module_try_get() took. */
+void asahi_g15_module_put(void)
+{
+	module_put(THIS_MODULE);
 }
 
 /*
@@ -237,13 +256,6 @@ int asahi_g15_adt_phram(u64 *start, u64 *size)
 	return 0;
 }
 
-/* The range is disjoint from System RAM (ADT region admission). */
-bool asahi_g15_ram_disjoint(u64 start, u64 size)
-{
-	return region_intersects(start, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) ==
-	       REGION_DISJOINT;
-}
-
 /*
  * Whether DMA mappings of the device skip cache maintenance. The G15 firmware
  * objects rely on the DMA mapping cleaning their pages to the point of
@@ -252,42 +264,6 @@ bool asahi_g15_ram_disjoint(u64 start, u64 size)
 bool asahi_g15_dma_coherent(struct device *dev)
 {
 	return dev_is_dma_coherent(dev);
-}
-
-/*
- * Every page must be valid, System RAM and still reserved from the allocator.
- * REGION_INTERSECTS alone also accepts RAM mixed with undefined memory holes.
- */
-bool asahi_g15_ram_within(u64 start, u64 size)
-{
-	u64 end, pa;
-
-	if (!size || !IS_ALIGNED(start, PAGE_SIZE) ||
-	    !IS_ALIGNED(size, PAGE_SIZE) || check_add_overflow(start, size, &end))
-		return false;
-	for (pa = start; pa < end; pa += PAGE_SIZE) {
-		unsigned long pfn = PHYS_PFN(pa);
-
-		if (!pfn_valid(pfn) || !page_is_ram(pfn) ||
-		    !PageReserved(pfn_to_page(pfn)))
-			return false;
-	}
-	return true;
-}
-
-/* One classification for every adopted-UAT and firmware-region CPU mapping. */
-unsigned int asahi_g15_memory_mode(u64 start, u64 size)
-{
-	u64 end;
-
-	if (!size || !IS_ALIGNED(start, PAGE_SIZE) ||
-	    !IS_ALIGNED(size, PAGE_SIZE) || check_add_overflow(start, size, &end))
-		return 0;
-	if (asahi_g15_ram_within(start, size))
-		return MEMREMAP_WB;
-	if (asahi_g15_ram_disjoint(start, size))
-		return MEMREMAP_WC;
-	return 0;
 }
 
 /* The inherited RTKit buffer inside firmware DATA. */

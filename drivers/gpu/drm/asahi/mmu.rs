@@ -312,6 +312,7 @@ struct VmInner {
     va_range: Range<u64>,
     page_table: UatPageTable,
     mapping_epoch: Option<Arc<MappingEpoch>>,
+    bind_sequence: Arc<AtomicU64>,
     epoch: Option<u64>,
     mm: mm::Allocator<(), KernelMappingInner>,
     uat_inner: Arc<UatInner>,
@@ -368,6 +369,11 @@ struct VmBinding {
 /// Data associated with a VM <=> BO pairing
 #[pin_data]
 struct VmBoData {
+    /// Highest sequence assigned to a GPUVA linked to this VM/BO pair.
+    ///
+    /// Map steps update this monotonically under the VM reservation before
+    /// linking the GPUVA. Remap pieces keep their original sequence.
+    newest_bind: AtomicU64,
     #[pin]
     segments: Mutex<Option<KVVec<(DmaAddress, ResourceSize)>>>,
 }
@@ -410,6 +416,9 @@ struct StepContext<'ctx> {
 
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
+
+    /// Sequence assigned by the successful map for its related metadata.
+    bind_sequence: u64,
 }
 
 impl<'ctx> StepContext<'ctx> {
@@ -422,6 +431,7 @@ impl<'ctx> StepContext<'ctx> {
             dev,
             prot,
             resources,
+            bind_sequence: 0,
         })
     }
 
@@ -452,6 +462,7 @@ impl<'ctx> StepContext<'ctx> {
 #[derive(Default, Clone)]
 struct VmGpuVa {
     prot: Option<Prot>,
+    bind_sequence: u64,
 }
 
 impl gpuvm::DriverGpuVm for VmInner {
@@ -470,6 +481,11 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: OpMap<'op, Self>,
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpMapped<'op, Self>, Error> {
+        let bind_sequence = self.bind_sequence.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| value.checked_add(1),
+        ).map_err(|_| EOVERFLOW)? + 1;
         let _mutation = self.mapping_mutation();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
         let mut iova = op.addr();
@@ -547,12 +563,18 @@ impl gpuvm::DriverGpuVm for VmInner {
                 return Err(error);
             }
         };
+        op.vm_bo()
+            .data()
+            .newest_bind
+            .fetch_max(bind_sequence, Ordering::Relaxed);
         let op = op.insert(
             gpuva,
             VmGpuVa {
                 prot: Some(ctx.prot),
+                bind_sequence,
             },
         );
+        ctx.bind_sequence = bind_sequence;
 
         self.tlbi_contexts_naming_root(map_addr, map_length);
         Ok(op)
@@ -578,6 +600,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpRemapped<'op, Self>, Error> {
         let orig_prot = op.va_to_unmap().data().prot.ok_or(EINVAL)?;
+        let orig_bind_sequence = op.va_to_unmap().data().bind_sequence;
         let orig_invalidated = op.va_to_unmap().flags().contains(GpuVaFlag::INVALIDATED);
 
         // Only unmap the hole between prev/next, if they exist
@@ -642,9 +665,11 @@ impl gpuvm::DriverGpuVm for VmInner {
             [prev_gpuva, next_gpuva],
             VmGpuVa {
                 prot: Some(orig_prot),
+                bind_sequence: orig_bind_sequence,
             },
             VmGpuVa {
                 prot: Some(orig_prot),
+                bind_sequence: orig_bind_sequence,
             },
         );
 
@@ -882,6 +907,7 @@ pub(crate) struct Vm {
     dev: ARef<device::Device>,
     id: u64,
     mapping_epoch: Option<Arc<MappingEpoch>>,
+    bind_sequence: Arc<AtomicU64>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
     residency: Option<Arc<residency::Gate>>,
     context_bindings: Option<Arc<context::ContextBindings>>,
@@ -1477,7 +1503,7 @@ unsafe impl Send for UatShared {}
 #[pin_data]
 struct UatInner {
     firmware: UatFirmware,
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     clean_poc: bool,
     #[pin]
     shared: Mutex<UatShared>,
@@ -1665,7 +1691,7 @@ impl Vm {
             UatPageTable::new(geometry.ias, geometry.oas)?
         };
 
-        #[cfg(CONFIG_DRM_ASAHI_G15)]
+        #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
         let page_table = {
             let mut page_table = page_table;
             if uat_inner.clean_poc {
@@ -1704,6 +1730,7 @@ impl Vm {
         } else {
             None
         };
+        let bind_sequence = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
         let unique_gpuvm = gpuvm::GpuVm::new::<Error, _>(
             c"Asahi::GpuVm",
             &dev,
@@ -1716,6 +1743,7 @@ impl Vm {
                 va_range: va_range.clone(),
                 page_table,
                 mapping_epoch: mapping_epoch.clone(),
+                bind_sequence: bind_sequence.clone(),
                 epoch: Some(0),
                 mm,
                 uat_inner,
@@ -1730,6 +1758,7 @@ impl Vm {
             id,
             gpuvm,
             mapping_epoch,
+            bind_sequence,
             lifetime: None,
             residency: None,
             context_bindings: None,
@@ -1753,7 +1782,7 @@ impl Vm {
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     pub(crate) fn with_tracked_status(mut self) -> Result<Self> {
         self.status = Some(Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
@@ -1761,7 +1790,7 @@ impl Vm {
     }
 
     /// The identifier this VM was created with (G15 keeps per-VM state keyed by it).
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1773,7 +1802,7 @@ impl Vm {
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
     /// mappings cannot change during the copy (GPUVM exec lock).
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         let mut inner = lock_vm(&self.gpuvm, None, false)?;
         let mut done = 0usize;
@@ -1894,6 +1923,10 @@ impl Vm {
         self.mapping_epoch.as_ref()?.snapshot()
     }
 
+    fn current_bind_sequence(&self) -> u64 {
+        self.bind_sequence.load(Ordering::Acquire)
+    }
+
     /// Get the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.binding.lock().ttb
@@ -1950,7 +1983,10 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData {
+                newest_bind: AtomicU64::new(0),
+                segments <- new_mutex!(None),
+            }))?;
 
         let size = object_range.range();
         let mut vm_exec = unsafe {
@@ -2031,7 +2067,10 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(&gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
+            .obtain(&gem, pin_init!(VmBoData {
+                newest_bind: AtomicU64::new(0),
+                segments <- new_mutex!(None),
+            }))?;
 
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
@@ -2112,7 +2151,10 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData {
+                newest_bind: AtomicU64::new(0),
+                segments <- new_mutex!(None),
+            }))?;
 
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
@@ -2338,6 +2380,65 @@ impl Vm {
         Ok(())
     }
 
+    fn drop_mappings_before(&self, gem: &gem::Object, sequence: u64) -> Result {
+        let _residency = self.enter_retirement_residency();
+        // Removing whole mappings only does unmaps, so no preallocated VAs
+        // are needed for the indexed path.
+        let mut resources = VmOpResources {
+            preallocated_gpuvas: [None, None, None],
+        };
+        let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
+
+        // The BO's newest sequence is checked under the same lock as binds. If
+        // it is not newer than the close, every mapping belongs to that close
+        // and the per-object list is safe and substantially cheaper to walk.
+        let mut vm_exec = match unsafe { self.gpuvm.exec_lock(None, false) } {
+            Err(error) if error == ENOMEM => {
+                return self.drop_mappings_filtered(gem, sequence);
+            }
+            result => result?,
+        };
+        let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) else {
+            return Ok(());
+        };
+        if bo.data().newest_bind.load(Ordering::Relaxed) > sequence {
+            drop(vm_exec);
+            drop(bo);
+            return self.drop_mappings_filtered(gem, sequence);
+        }
+
+        mod_dev_dbg!(self.dev, "MMU: deferred bo_unmap\n");
+        let result = vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo);
+        if result.is_ok() {
+            self.untrack_context_object_before(gem, sequence);
+            self.untrack_shared_object_before(gem, sequence);
+        }
+        drop(vm_exec);
+        drop(bo);
+        if result == Err(ENOMEM) {
+            return self.drop_mappings_filtered(gem, sequence);
+        }
+        result
+    }
+
+    /// A newer binding shares the BO list, so select the closed generation by
+    /// walking the VM without allocating. This is also the ENOMEM fallback.
+    fn drop_mappings_filtered(&self, gem: &gem::Object, sequence: u64) -> Result {
+        let mut inner = self.gpuvm.lock_inner();
+        let result = inner.unmap_object_where(
+            gem,
+            |va| va.data().bind_sequence <= sequence,
+            VmInner::unmap_gpuva,
+        );
+        if result.is_ok() {
+            self.untrack_context_object_before(gem, sequence);
+            self.untrack_shared_object_before(gem, sequence);
+        }
+        drop(inner);
+        self.bo_deferred_cleanup();
+        result
+    }
+
     /// Preserve the indexed fast path normally; memory pressure must not lose
     /// accepted object cleanup just because an exec or operation list failed.
     fn drop_mappings_low_memory(&self, gem: &gem::Object) -> Result {
@@ -2420,7 +2521,7 @@ impl Drop for VmInner {
 
 /// Physical regions of a UAT whose handoff the generation has already established itself
 /// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
+#[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
 pub(crate) struct AdoptedRegions {
     /// The handoff region (PPL magic, lock and flush requests).
     pub(crate) handoff: Range<PhysicalAddr>,
@@ -2431,7 +2532,7 @@ pub(crate) struct AdoptedRegions {
 }
 
 impl Uat {
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     /// Map a region given by its physical range, write-combined.
     fn map_physical(range: &Range<PhysicalAddr>, min_size: usize) -> Result<UatRegion> {
         let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
@@ -2466,7 +2567,7 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     /// Creates a `Uat` for a handoff that the caller establishes itself (G15).
     ///
     /// This only maps the handoff and the TTBAT (write-combined); neither is written here. The
@@ -2548,13 +2649,13 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     /// Root of the kernel lower `Vm`, for TTBAT context 0 of an adopted handoff.
     pub(crate) fn kernel_lower_root(&self) -> PhysicalAddr {
         self.kernel_lower_vm.ttb()
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     /// Root whose driver-window entry names the second-level table of [`Self::kernel_vm`]'s
     /// driver window. With [`Self::new_adopted`] this is the shadow root that no context names.
     pub(crate) fn kernel_window_root(&self) -> PhysicalAddr {
@@ -2900,7 +3001,7 @@ impl Uat {
         Arc::pin_init(
             try_pin_init!(UatInner {
                 firmware,
-                #[cfg(CONFIG_DRM_ASAHI_G15)]
+                #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
                 clean_poc: false,
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")

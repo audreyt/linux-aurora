@@ -2,8 +2,9 @@
 # locally: tools/aurora-ci/README.rst.
 #
 #   pull request   checks only (commit hygiene, host test suites, the CI's
-#                  own tests), on every push; add the ci:build label for a
-#                  build now (kernel-ci-label.yml)
+#                  own tests), on every push; everything for the team
+#                  (.github/VOUCHED.td) once out of draft; add the ci:build
+#                  label for a build now (kernel-ci-label.yml)
 #   merge queue    everything: the kernel package built with omarchy-pkgs'
 #                  own recipe, KUnit, a QEMU boot that loads every module,
 #                  and a comparison with the target branch's package

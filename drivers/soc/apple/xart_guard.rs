@@ -33,6 +33,17 @@
 //! record that was never written, which is harmless, and a failed adoption is
 //! retried in the same slot rather than skipped. It can never leave a Linux
 //! record that the next boot treats as another OS's.
+//!
+//! One exception lets a fresh install set up Touch ID on a warm-attach Mac.
+//! Blessing a newly installed OS in macOS leaves a SEP-xART locker (kind 4)
+//! that every OS's enclave reads at attach in a pending state, and the next
+//! enclave to save its state commits it. macOS's enclave does that at boot;
+//! under Linux the first save is the first `CREATE_KEYBAG`. While that create
+//! runs on an install whose list is loaded and empty ([`FirstSetup`]), the
+//! guard lets the enclave rewrite the first existing kind-4 locker it writes;
+//! nothing identifies that locker as the pending one. It does not list the
+//! locker as Linux's, and the list records the window as consumed before it
+//! opens, so no later create on this install gets it again.
 
 use crate::shim::StoreFile;
 use crate::xart_store::{crc32_ieee, Key};
@@ -77,6 +88,24 @@ pub(crate) fn decide(level: u8, key: &Key, existed: bool, owned: bool) -> Verdic
     } else {
         Verdict::Adopt
     }
+}
+
+/// Whether the first keybag creation of a fresh install is in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstSetup {
+    /// No first keybag creation is in progress.
+    Closed,
+    /// The enclave may rewrite one existing SEP-xART locker.
+    Open,
+    /// It has; further refusals stand.
+    Used,
+}
+
+/// Whether a request the guard would refuse passes as the enclave committing a
+/// pending SEP-xART locker during the first keybag creation: a rewrite (not a
+/// delete) of a kind-4 record at level 1, while the window is open.
+pub(crate) fn first_setup_allows(level: u8, window: FirstSetup, key: &Key, write: bool) -> bool {
+    level == 1 && window == FirstSetup::Open && write && key.kind == 4
 }
 
 /// The guard level for `xart_guard=param` on a platform whose profile
@@ -139,15 +168,25 @@ impl MatchFacts {
     }
 }
 
-/// Encodes one list entry.
-pub(crate) fn encode(key: &Key) -> [u8; ENTRY_SIZE] {
+fn entry_bytes(kind: u8, uuid: &[u8; 16]) -> [u8; ENTRY_SIZE] {
     let mut entry = [0u8; ENTRY_SIZE];
     entry[..4].copy_from_slice(ENTRY_MAGIC);
-    entry[4] = key.kind;
-    entry[8..24].copy_from_slice(&key.uuid);
+    entry[4] = kind;
+    entry[8..24].copy_from_slice(uuid);
     let crc = crc32_ieee(&entry[..24]);
     entry[24..28].copy_from_slice(&crc.to_le_bytes());
     entry
+}
+
+/// Encodes one list entry.
+pub(crate) fn encode(key: &Key) -> [u8; ENTRY_SIZE] {
+    entry_bytes(key.kind, &key.uuid)
+}
+
+/// The entry that records this install's first-setup window as consumed.
+/// Kind 0 is no session record's, so it never lists a record as Linux's.
+pub(crate) fn setup_consumed() -> [u8; ENTRY_SIZE] {
+    entry_bytes(0, b"first setup used")
 }
 
 /// Decodes one list entry; `None` for a torn or foreign one.
@@ -206,6 +245,7 @@ pub(crate) struct Guard<F: ListFile = StoreFile> {
     owned: KVec<Key>,
     existed: KVec<Key>,
     refused: usize,
+    first_setup: FirstSetup,
 }
 
 impl Guard {
@@ -231,6 +271,7 @@ impl<F: ListFile> Guard<F> {
             owned: KVec::new(),
             existed: existing,
             refused: 0,
+            first_setup: FirstSetup::Closed,
         };
         // A list created this boot (or by a crashed one) is only safe to adopt
         // into once its name is durable: fsync() of the file alone does not
@@ -288,6 +329,7 @@ impl<F: ListFile> Guard<F> {
             match decode(&entry) {
                 Some(key) if !self.owned.contains(&key) => self.owned.push(key, GFP_KERNEL)?,
                 Some(_) => {}
+                None if entry == setup_consumed() => {}
                 None => torn += 1,
             }
         }
@@ -307,6 +349,39 @@ impl<F: ListFile> Guard<F> {
     /// Whether Linux's list was loaded. Without it nothing can be adopted.
     pub(crate) fn list_loaded(&self) -> bool {
         self.file.is_some()
+    }
+
+    /// Opens the first-setup window for one keybag creation, only at level 1
+    /// on a fresh install: the list loaded and holding no entry, torn ones
+    /// included. The window is recorded as consumed in the list, durably,
+    /// before it opens, so it opens at most once per install whatever becomes
+    /// of the keybag. `Ok(false)` when the install is not eligible; an error,
+    /// with the window shut, when the record could not be made durable.
+    pub(crate) fn open_first_setup(&mut self) -> Result<bool> {
+        if self.level != 1 {
+            return Ok(false);
+        }
+        let Some(file) = self.file.as_ref() else {
+            return Ok(false);
+        };
+        // The file's length, not `end`: a torn first entry rounds `end` down
+        // to 0 but is still an earlier setup.
+        if !file.size().is_ok_and(|size| size == 0) {
+            return Ok(false);
+        }
+        // The list's directory entry was flushed when it was opened. A failed
+        // write or flush leaves `end` at 0, so an adoption overwrites the
+        // slot, and any bytes that survive keep the window shut.
+        file.write_all(0, &setup_consumed())?;
+        file.sync()?;
+        self.end = ENTRY_SIZE as u64;
+        self.first_setup = FirstSetup::Open;
+        Ok(true)
+    }
+
+    /// Closes the first-setup window, used or not.
+    pub(crate) fn close_first_setup(&mut self) {
+        self.first_setup = FirstSetup::Closed;
     }
 
     fn adopt(&mut self, key: &Key) -> Result<()> {
@@ -347,6 +422,14 @@ impl<F: ListFile> Guard<F> {
                     e
                 )
             }),
+            Verdict::Refuse if first_setup_allows(self.level, self.first_setup, key, write) => {
+                self.first_setup = FirstSetup::Used;
+                pr_info!(
+                    "xART guard: allowed the enclave to commit an existing kind-{} locker during this install's first keybag creation\n",
+                    key.kind
+                );
+                Ok(())
+            }
             Verdict::Refuse => {
                 crate::diag::xart_guard_refused();
                 self.refused += 1;
@@ -564,6 +647,146 @@ mod tests {
         assert_eq!(guard.check(&foreign, false), Err(EPERM));
         // A refusal lists nothing.
         assert_eq!(bytes.borrow().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn first_setup_allows_only_a_kind_4_rewrite_at_level_1() {
+        let open = FirstSetup::Open;
+        assert!(first_setup_allows(1, open, &session(1), true));
+        assert!(!first_setup_allows(1, open, &session(1), false));
+        assert!(!first_setup_allows(1, open, &Key::new(3, [1; 16]), true));
+        assert!(!first_setup_allows(2, open, &session(1), true));
+        assert!(!first_setup_allows(1, FirstSetup::Closed, &session(1), true));
+        assert!(!first_setup_allows(1, FirstSetup::Used, &session(1), true));
+    }
+
+    #[test]
+    fn a_fresh_install_commits_one_locker_during_its_first_create() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        let pending = session(1);
+        let other = session(2);
+        let user = Key::new(3, [3; 16]);
+        let mut guard = Guard::with_file(1, keys(&[pending, other, user])?, Ok(mem(&bytes)));
+        // Outside the window the locker is protected as before.
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+        assert_eq!(guard.open_first_setup(), Ok(true));
+        // The window is consumed in the list before it opens.
+        assert_eq!(&bytes.borrow()[..], &setup_consumed()[..]);
+        // A delete, or a USER-xART locker, does not use the window.
+        assert_eq!(guard.check(&other, false), Err(EPERM));
+        assert_eq!(guard.check(&user, true), Err(EPERM));
+        assert_eq!(guard.check(&pending, true), Ok(()));
+        // One rewrite only, and the locker does not become Linux's.
+        assert_eq!(guard.check(&other, true), Err(EPERM));
+        assert_eq!(listed(&bytes)[..], [None]);
+        guard.close_first_setup();
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+        assert_eq!(guard.refused, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn first_setup_opens_once_per_install() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        let pending = session(1);
+        let mut guard = Guard::with_file(1, keys(&[pending])?, Ok(mem(&bytes)));
+        assert_eq!(guard.open_first_setup(), Ok(true));
+        guard.close_first_setup();
+        // A second create this boot, unused window or not.
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+
+        // After a reboot, or with the keybag file removed by a Touch ID reset,
+        // which keeps the list.
+        let mut guard = Guard::with_file(1, keys(&[pending])?, Ok(mem(&bytes)));
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+        assert_eq!(bytes.borrow().len(), ENTRY_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn the_consumed_marker_lists_no_record() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        bytes.borrow_mut().extend_from_slice(&setup_consumed(), GFP_KERNEL)?;
+        let fresh = session(5);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
+        assert!(guard.list_loaded());
+        assert_eq!(guard.owned.len(), 0);
+        // An adoption appends after the marker and keeps it.
+        assert_eq!(guard.check(&fresh, true), Ok(()));
+        assert_eq!(listed(&bytes)[..], [None, Some(fresh)]);
+        assert_eq!(&bytes.borrow()[..ENTRY_SIZE], &setup_consumed()[..]);
+        assert_eq!(guard.open_first_setup(), Ok(false));
+
+        // Adopting in the same boot as the window also appends after it.
+        let bytes = RefCell::new(KVec::new());
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(mem(&bytes)));
+        assert_eq!(guard.open_first_setup(), Ok(true));
+        assert_eq!(guard.check(&fresh, true), Ok(()));
+        assert_eq!(listed(&bytes)[..], [None, Some(fresh)]);
+        Ok(())
+    }
+
+    #[test]
+    fn first_setup_stays_shut_when_it_cannot_be_recorded() -> Result<()> {
+        let pending = session(1);
+        let fresh = session(5);
+
+        // The write fails: nothing lands, and the window stays shut.
+        let bytes = RefCell::new(KVec::new());
+        let faults = Faults::default();
+        faults.write.set(true);
+        let mut guard = Guard::with_file(1, keys(&[pending])?, Ok(faulty(&bytes, &faults)));
+        assert_eq!(guard.open_first_setup(), Err(EIO));
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+        faults.write.set(false);
+        assert_eq!(guard.open_first_setup(), Ok(true));
+
+        // The marker lands but its flush fails: the window stays shut, and
+        // the bytes that landed keep it shut on every later attempt.
+        let bytes = RefCell::new(KVec::new());
+        let faults = Faults::default();
+        faults.sync.set(true);
+        let mut guard = Guard::with_file(1, keys(&[pending])?, Ok(faulty(&bytes, &faults)));
+        assert_eq!(guard.open_first_setup(), Err(EIO));
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+        faults.sync.set(false);
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        // The unflushed slot is the next adoption's.
+        assert_eq!(guard.check(&fresh, true), Ok(()));
+        assert_eq!(listed(&bytes)[..], [Some(fresh)]);
+        let mut guard = Guard::with_file(1, keys(&[pending])?, Ok(mem(&bytes)));
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        Ok(())
+    }
+
+    #[test]
+    fn first_setup_needs_level_1_and_an_empty_loaded_list() -> Result<()> {
+        let pending = session(1);
+        let own = session(2);
+        let bytes = RefCell::new(list_of(&[own])?);
+        let mut guard = Guard::with_file(1, keys(&[pending, own])?, Ok(mem(&bytes)));
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+
+        // A torn entry is still an earlier setup.
+        let torn = RefCell::new(KVec::new());
+        torn.borrow_mut().extend_from_slice(&encode(&own)[..10], GFP_KERNEL)?;
+        let mut guard = Guard::with_file(1, keys(&[pending])?, Ok(mem(&torn)));
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        assert_eq!(torn.borrow().len(), 10);
+
+        let mut guard = Guard::<MemFile<'_>>::with_file(1, keys(&[pending])?, Err(ENOENT));
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        assert_eq!(guard.check(&pending, true), Err(EPERM));
+
+        // Level 2 gets no window and consumes nothing.
+        let empty = RefCell::new(KVec::new());
+        let mut guard = Guard::with_file(2, keys(&[pending])?, Ok(mem(&empty)));
+        assert_eq!(guard.open_first_setup(), Ok(false));
+        assert_eq!(empty.borrow().len(), 0);
         Ok(())
     }
 

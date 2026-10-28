@@ -103,7 +103,9 @@ patternProperties:
 
     properties:
       compatible:
-        const: apple,t8140-clpc
+        enum:
+          - apple,t8132-clpc
+          - apple,t8140-clpc
 
       reg:
         maxItems: 1

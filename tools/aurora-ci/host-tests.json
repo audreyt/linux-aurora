@@ -17,6 +17,8 @@
   "device-tree-compiler",
   "flex",
   "libarchive-tools",
+  "libegl-dev",
+  "libgles-dev",
   "libnotify-bin",
   "lld",
   "llvm",
@@ -1820,6 +1822,36 @@
    ]
   },
   {
+   "name": "tools/aurora-sep/recipes/mesa-m3/tests/test-system-provider.py",
+   "group": "tools",
+   "argv": [
+    "python3",
+    "tools/aurora-sep/recipes/mesa-m3/tests/test-system-provider.py"
+   ]
+  },
+  {
+   "name": "tools/aurora-sep/recipes/mesa-m3/tests/test-system-board.c",
+   "group": "tools",
+   "setup": [
+    [
+     "cc",
+     "-std=c11",
+     "-Wall",
+     "-Wextra",
+     "-Werror",
+     "-pedantic",
+     "-O2",
+     "tools/aurora-sep/recipes/mesa-m3/tests/test-system-board.c",
+     "-ldl",
+     "-o",
+     "{output}"
+    ]
+   ],
+   "argv": [
+    "{output}"
+   ]
+  },
+  {
    "name": "tools/aurora-sep/recipes/mesa-m3/tests/test-uwsm.sh",
    "group": "tools",
    "argv": [
@@ -2165,6 +2197,35 @@
    ],
    "rust": "1.93.1",
    "note": "Public synthetic Rust/C host cases; two unavailable private-hardware fixture cases remain explicitly ignored."
+  },
+  {
+   "name": "tools/asahi/t6030-pmp-dt-tests.py",
+   "group": "tools",
+   "setup": [
+    [
+     "make",
+     "-s",
+     "O={output}/kbuild",
+     "ARCH=arm64",
+     "allnoconfig"
+    ],
+    [
+     "make",
+     "-s",
+     "O={output}/kbuild",
+     "ARCH=arm64",
+     "scripts_dtc"
+    ]
+   ],
+   "argv": [
+    "python3",
+    "tools/asahi/t6030-pmp-dt-tests.py",
+    "--dtc",
+    "{output}/kbuild/scripts/dtc/dtc",
+    "--output",
+    "{output}/dtbs"
+   ],
+   "note": "Compile J514S/J516S default and static PMP profiles; check supplier nodes and alias in the resulting DTBs."
   },
   {
    "name": "tools/asahi/t6030-pmp-graph-tests.py",

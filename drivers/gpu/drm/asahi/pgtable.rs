@@ -95,7 +95,7 @@ pub(crate) fn clean_poc(ptr: *const u8, len: usize) {
 /// Cleans and invalidates the CPU data cache lines covering `len` bytes at `ptr` to the point of
 /// coherency, so that later CPU reads observe what a non-snooping agent wrote. Lines the CPU wrote
 /// are written back first. [`poc_barrier`] completes the maintenance.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
+#[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
 pub(crate) fn clean_invalidate_poc(ptr: *const u8, len: usize) {
     if len == 0 {
         return;
@@ -305,7 +305,7 @@ pub(crate) struct UatPageTable {
     oas_mask: u64,
     /// Clean new tables and changed entries to the point of coherency, for a UAT walker that does
     /// not snoop the CPU caches ([`Self::enable_clean_poc`]).
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     clean_poc: bool,
 }
 
@@ -321,7 +321,7 @@ impl UatPageTable {
             va_range: 0..(1u64 << ias),
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
-            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
             clean_poc: false,
         })
     }
@@ -332,7 +332,7 @@ impl UatPageTable {
     /// From now on, a new table page is cleaned before its parent descriptor names it, a changed
     /// table or leaf descriptor is cleaned after the store, and every mutating walk ends with a
     /// `dsb osh`. Call it before anything is mapped and before any context names the root.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
     pub(crate) fn enable_clean_poc(&mut self) -> Result {
         self.clean_poc = true;
         // SAFETY: The root is a RAM page owned or borrowed by this page table for its lifetime.
@@ -345,14 +345,14 @@ impl UatPageTable {
         Ok(())
     }
 
-    /// Whether changes are cleaned to the point of coherency (always false without G15 support).
+    /// Whether changes are cleaned to the point of coherency (always false without UAT adoption support).
     #[inline(always)]
     fn cleans_poc(&self) -> bool {
-        #[cfg(CONFIG_DRM_ASAHI_G15)]
+        #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
         {
             self.clean_poc
         }
-        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+        #[cfg(not(CONFIG_DRM_ASAHI_UAT_ADOPTION))]
         {
             false
         }
@@ -396,7 +396,7 @@ impl UatPageTable {
             va_range,
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
-            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
             clean_poc: false,
         })
     }

@@ -669,8 +669,31 @@ impl SepData {
                 return false;
             }
         };
+        // A cold-boot Mac's create rewrites a pre-Linux record for its own
+        // reasons (XART-SAFETY.md), so only warm attach gets the window.
+        let first_setup = if self.profile.bootstrap == profile::Bootstrap::WarmRegister {
+            match self.with_store(|store| store.open_first_setup()) {
+                Some(Ok(open)) => open,
+                None => false,
+                // Unsent, so the intent is dropped as retryable.
+                Some(Err(e)) => {
+                    dev_err!(
+                        self.dev,
+                        "sks: cannot record the xART guard's first-setup window ({:?}); not creating the keybag this boot\n",
+                        e
+                    );
+                    return false;
+                }
+            }
+        } else {
+            false
+        };
         intent.sending();
-        let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
+        let exchanged = self.sks_exchange(request.name, request.msg, &request.img);
+        if first_setup {
+            self.with_store(|store| store.close_first_setup());
+        }
+        let Some(out) = exchanged else {
             dev_err!(
                 self.dev,
                 "sks: CREATE_KEYBAG exchange did not complete (buffers unregistered, wedged, or OOL write failed)\n"

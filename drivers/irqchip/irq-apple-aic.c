@@ -203,6 +203,17 @@
 #define SYS_IMP_APL_UPMSR_EL1		sys_reg(3, 7, 15, 6, 4)
 #define UPMSR_IACT			BIT(0)
 
+/*
+ * System interrupt configuration. AICv2 and later have no per-IRQ CPU target:
+ * the controller delivers each IRQ to one of the CPUs that accept IRQs, and
+ * this per-CPU field says whether a CPU does. A CPU whose field reads
+ * SIQ_CFG_ROUTE_NONE never receives an AIC IRQ. Only used on SoCs where this
+ * has been verified on hardware (aic_info.siq_cfg_routing).
+ */
+#define SYS_IMP_APL_SIQ_CFG_EL1		sys_reg(3, 4, 15, 10, 4)
+#define SIQ_CFG_ROUTE			GENMASK(1, 0)
+#define SIQ_CFG_ROUTE_NONE		3
+
 /* MPIDR fields */
 #define MPIDR_CPU(x)			MPIDR_AFFINITY_LEVEL(x, 0)
 #define MPIDR_CLUSTER(x)		MPIDR_AFFINITY_LEVEL(x, 1)
@@ -261,6 +272,15 @@ struct aic_info {
 	bool fast_ipi;
 	bool local_fast_ipi;
 	bool vm_timer_fiq_readonly;
+	/*
+	 * SIQ_CFG routing verified on hardware: at EL2, AICv2+ IRQs report the
+	 * CPUs that accept them as their effective affinity. The set grows as
+	 * CPUs start and IRQs keep the set they were given, which is enough
+	 * while only one CPU accepts IRQs. A SoC listed here with more than one
+	 * accepting CPU would also need those masks refreshed when such a CPU
+	 * comes online.
+	 */
+	bool siq_cfg_routing;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -307,6 +327,14 @@ static const struct aic_info aic3_info __initconst = {
 	.local_fast_ipi = true,
 };
 
+static const struct aic_info aic3_t8140_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.siq_cfg_routing = true,
+};
+
 static const struct aic_info aic3_t8142_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
@@ -316,6 +344,10 @@ static const struct aic_info aic3_t8142_info __initconst = {
 };
 
 static const struct of_device_id aic_info_match[] = {
+	{
+		.compatible = "apple,t8140-aic3",
+		.data = &aic3_t8140_info,
+	},
 	{
 		.compatible = "apple,t8142-aic3",
 		.data = &aic3_t8142_info,
@@ -362,6 +394,9 @@ struct aic_irq_chip {
 static DEFINE_PER_CPU(uint32_t, aic_fiq_unmasked);
 
 static struct aic_irq_chip *aic_irqc;
+
+/* CPUs that accept hardware IRQs, read from SIQ_CFG where siq_cfg_routing is set */
+static struct cpumask aic_irq_cpus;
 
 static void aic_handle_ipi(struct pt_regs *regs);
 
@@ -506,6 +541,32 @@ static struct irq_chip aic2_chip = {
 	.irq_mask = aic_irq_mask,
 	.irq_unmask = aic_irq_unmask,
 	.irq_eoi = aic_irq_eoi,
+	.irq_set_type = aic_irq_set_type,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
+};
+
+/*
+ * AICv2 and later cannot be steered: the controller delivers each IRQ to one of
+ * the CPUs that accept IRQs, whatever the requested mask. Where SIQ_CFG says
+ * which CPUs those are, report them, so that threaded handlers run where the
+ * hard IRQ is taken. The requested mask is accepted and kept only for
+ * reporting.
+ */
+static int aic2_routed_irq_set_affinity(struct irq_data *d,
+					const struct cpumask *mask_val, bool force)
+{
+	irq_data_update_effective_affinity(d, cpumask_empty(&aic_irq_cpus) ?
+					   cpu_possible_mask : &aic_irq_cpus);
+	return IRQ_SET_MASK_OK;
+}
+
+/* AIC2 on SoCs whose SIQ_CFG routing is read (aic_info.siq_cfg_routing, at EL2) */
+static struct irq_chip aic2_routed_chip = {
+	.name = "AIC2",
+	.irq_mask = aic_irq_mask,
+	.irq_unmask = aic_irq_unmask,
+	.irq_eoi = aic_irq_eoi,
+	.irq_set_affinity = aic2_routed_irq_set_affinity,
 	.irq_set_type = aic_irq_set_type,
 	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
@@ -684,7 +745,8 @@ static int aic_irq_domain_map(struct irq_domain *id, unsigned int irq,
 	struct irq_chip *chip = &aic_chip;
 
 	if (ic->info.version == 2 || ic->info.version == 3)
-		chip = &aic2_chip;
+		chip = ic->info.siq_cfg_routing && is_kernel_in_hyp_mode() ?
+		       &aic2_routed_chip : &aic2_chip;
 
 	if (type == AIC_EVENT_TYPE_IRQ) {
 		irq_domain_set_info(id, irq, hw, chip, id->host_data,
@@ -956,6 +1018,19 @@ static int aic_init_cpu(unsigned int cpu)
 			aic_ic_write(aic_irqc, AIC_IPI_MASK_SET, AIC_IPI_SELF);
 			aic_ic_write(aic_irqc, AIC_IPI_MASK_CLR, AIC_IPI_OTHER);
 		}
+	}
+
+	/*
+	 * Record whether the controller delivers IRQs to this CPU. SIQ_CFG is
+	 * read only on SoCs where its routing has been verified on hardware,
+	 * and only at EL2, since a hypervisor or secure monitor may trap it.
+	 */
+	if (aic_irqc->info.siq_cfg_routing && is_kernel_in_hyp_mode()) {
+		if (FIELD_GET(SIQ_CFG_ROUTE, read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) ==
+		    SIQ_CFG_ROUTE_NONE)
+			cpumask_clear_cpu(cpu, &aic_irq_cpus);
+		else
+			cpumask_set_cpu(cpu, &aic_irq_cpus);
 	}
 
 	/* Initialize the local mask state */

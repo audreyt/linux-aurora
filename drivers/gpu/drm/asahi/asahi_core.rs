@@ -17,6 +17,10 @@ mod gem;
 mod g17;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
+// Without the G15 backend, only the UAT adoption the T8122 runtime shares with it.
+#[cfg(all(CONFIG_DRM_ASAHI_UAT_ADOPTION, not(CONFIG_DRM_ASAHI_G15)))]
+#[path = "g15/adopt.rs"]
+mod g15;
 mod gpu;
 mod hw;
 mod initdata;
